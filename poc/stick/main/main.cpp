@@ -22,8 +22,9 @@
 
 
 #define ESPNOW_CHANNEL         6
-#define ECHO_TIMEOUT_MS        5000
+#define RESPONSE_TIMEOUT_MS    5000
 #define TEST_INTERVAL_MS       3000
+#define HID_READ_LENGTH        64
 
 
 typedef struct {
@@ -117,6 +118,52 @@ static void print_hex(
     }
 
     printf("\n");
+}
+
+
+static esp_err_t exchange_operation(
+    uint8_t type,
+    uint32_t request_id,
+    const uint8_t *body,
+    size_t body_length,
+    received_frame_t *received
+)
+{
+    uint8_t frame[ESP_NOW_MAX_DATA_LEN];
+    size_t frame_length = hid_tunnel_encode(
+        frame,
+        sizeof(frame),
+        type,
+        request_id,
+        body,
+        body_length
+    );
+
+    if (frame_length == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t err = esp_now_send(
+        broadcast_address,
+        frame,
+        frame_length
+    );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (
+        xQueueReceive(
+            receive_queue,
+            received,
+            pdMS_TO_TICKS(RESPONSE_TIMEOUT_MS)
+        ) != pdTRUE
+    ) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    return ESP_OK;
 }
 
 
@@ -305,97 +352,113 @@ extern "C" void app_main(void)
         test_count++;
         xQueueReset(receive_queue);
 
-        uint8_t request_frame[ESP_NOW_MAX_DATA_LEN];
-        size_t request_frame_length = hid_tunnel_encode(
-            request_frame,
-            sizeof(request_frame),
-            HID_TUNNEL_TYPE_REQUEST,
-            test_count,
-            test_frame,
-            sizeof(test_frame)
-        );
-
         print_hex("TX HID", test_frame, sizeof(test_frame));
-        printf("Transaction: %lu\n", (unsigned long)test_count);
-
-        err = request_frame_length > 0
-            ? esp_now_send(
-                broadcast_address,
-                request_frame,
-                request_frame_length
-            )
-            : ESP_ERR_INVALID_SIZE;
-
-        if (err != ESP_OK) {
-            fail_count++;
-            ESP_LOGE(TAG, "send failed: %s", esp_err_to_name(err));
-            printf("RESULT: FAIL (SEND)\n");
-            show_result(
-                test_count, pass_count, fail_count,
-                -1, false, "SEND"
-            );
-            vTaskDelay(pdMS_TO_TICKS(TEST_INTERVAL_MS));
-            continue;
-        }
-
+        uint32_t write_id = (test_count * 2) - 1;
+        uint32_t read_id = write_id + 1;
         received_frame_t received;
+        const char *reason = "";
+        int response_length = -1;
 
-        if (
-            xQueueReceive(
-                receive_queue,
-                &received,
-                pdMS_TO_TICKS(ECHO_TIMEOUT_MS)
-            ) != pdTRUE
-        ) {
-            fail_count++;
-            printf("RX: timeout after %d ms\n", ECHO_TIMEOUT_MS);
-            printf("RESULT: FAIL (TIMEOUT)\n");
-            show_result(
-                test_count, pass_count, fail_count,
-                -1, false, "TIMEOUT"
-            );
-            vTaskDelay(pdMS_TO_TICKS(TEST_INTERVAL_MS));
-            continue;
-        }
-
-        const uint8_t *response_payload = NULL;
-        size_t response_length = 0;
-        uint32_t response_transaction_id = 0;
-
-        bool frame_valid = hid_tunnel_decode(
-            received.data,
-            received.length,
-            HID_TUNNEL_TYPE_RESPONSE,
-            &response_transaction_id,
-            &response_payload,
-            &response_length
+        printf("WRITE request: %lu\n", (unsigned long)write_id);
+        err = exchange_operation(
+            HID_TUNNEL_WRITE_REQUEST,
+            write_id,
+            test_frame,
+            sizeof(test_frame),
+            &received
         );
 
-        printf("Response source: " MACSTR "\n", MAC2STR(received.source));
+        hid_tunnel_message_t response = {};
+        bool write_ok =
+            err == ESP_OK &&
+            hid_tunnel_decode(
+                received.data,
+                received.length,
+                &response
+            ) &&
+            response.type == HID_TUNNEL_WRITE_RESPONSE &&
+            response.request_id == write_id &&
+            response.body_length == HID_TUNNEL_WRITE_RESPONSE_SIZE &&
+            response.body[0] == HID_TUNNEL_RESULT_OK &&
+            hid_tunnel_get_u16(&response.body[1]) == sizeof(test_frame);
 
-        if (frame_valid) {
-            printf(
-                "Response transaction: %lu\n",
-                (unsigned long)response_transaction_id
-            );
-            print_hex("RX HID", response_payload, response_length);
+        if (!write_ok) {
+            reason = err == ESP_ERR_TIMEOUT
+                ? "WRITE TIMEOUT"
+                : "WRITE ERROR";
         }
         else {
-            print_hex("RX FRAME", received.data, received.length);
+            printf(
+                "WRITE OK: %u bytes\n",
+                hid_tunnel_get_u16(&response.body[1])
+            );
+
+            uint8_t read_request[HID_TUNNEL_READ_REQUEST_SIZE];
+            hid_tunnel_put_u16(read_request, HID_READ_LENGTH);
+            hid_tunnel_put_u32(&read_request[2], RESPONSE_TIMEOUT_MS);
+
+            printf("READ request: %lu\n", (unsigned long)read_id);
+            err = exchange_operation(
+                HID_TUNNEL_READ_REQUEST,
+                read_id,
+                read_request,
+                sizeof(read_request),
+                &received
+            );
+
+            response = {};
+            bool read_frame_ok =
+                err == ESP_OK &&
+                hid_tunnel_decode(
+                    received.data,
+                    received.length,
+                    &response
+                ) &&
+                response.type == HID_TUNNEL_READ_RESPONSE &&
+                response.request_id == read_id &&
+                response.body_length >= HID_TUNNEL_READ_RESPONSE_OVERHEAD;
+
+            if (!read_frame_ok) {
+                reason = err == ESP_ERR_TIMEOUT
+                    ? "READ TIMEOUT"
+                    : "READ ERROR";
+            }
+            else if (response.body[0] != HID_TUNNEL_RESULT_OK) {
+                reason = response.body[0] == HID_TUNNEL_RESULT_TIMEOUT
+                    ? "READ TIMEOUT"
+                    : "READ USB ERROR";
+            }
+            else {
+                response_length = hid_tunnel_get_u16(&response.body[1]);
+
+                if (
+                    response.body_length !=
+                        HID_TUNNEL_READ_RESPONSE_OVERHEAD +
+                        response_length
+                ) {
+                    reason = "READ LENGTH";
+                    response_length = -1;
+                }
+                else {
+                    print_hex(
+                        "RX HID",
+                        &response.body[HID_TUNNEL_READ_RESPONSE_OVERHEAD],
+                        response_length
+                    );
+
+                    if (
+                        response_length < 3 ||
+                        response.body[3] != 0x02 ||
+                        response.body[4] != 0x61 ||
+                        response.body[5] != 0x41
+                    ) {
+                        reason = "BAD PREFIX";
+                    }
+                }
+            }
         }
 
-        bool transaction_matches =
-            frame_valid &&
-            response_transaction_id == test_count;
-
-        bool response_prefix_valid =
-            transaction_matches &&
-            response_length >= 3 &&
-            response_payload[0] == 0x02 &&
-            response_payload[1] == 0x61 &&
-            response_payload[2] == 0x41;
-
-        if (response_prefix_valid) {
+        if (reason[0] == '\0') {
             pass_count++;
             printf("RESULT: PASS\n");
             show_result(
@@ -405,26 +468,10 @@ extern "C" void app_main(void)
         }
         else {
             fail_count++;
-            const char *reason;
-
-            if (!frame_valid) {
-                reason = "FRAME";
-            }
-            else if (!transaction_matches) {
-                reason = "TRANSACTION";
-            }
-            else if (response_length < 3) {
-                reason = "LENGTH";
-            }
-            else {
-                reason = "BAD PREFIX";
-            }
-
             printf("RESULT: FAIL (%s)\n", reason);
             show_result(
                 test_count, pass_count, fail_count,
-                frame_valid ? response_length : -1,
-                false, reason
+                response_length, false, reason
             );
         }
 

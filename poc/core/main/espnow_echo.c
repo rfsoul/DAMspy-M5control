@@ -80,12 +80,12 @@ static esp_err_t ensure_peer(
 }
 
 
-bool espnow_transport_receive_request(
-    espnow_hid_request_t *request,
+bool espnow_transport_receive_message(
+    espnow_hid_message_t *message,
     TickType_t wait_ticks
 )
 {
-    if (request == NULL || receive_queue == NULL) {
+    if (message == NULL || receive_queue == NULL) {
         return false;
     }
 
@@ -101,38 +101,35 @@ bool espnow_transport_receive_request(
         return false;
     }
 
-    const uint8_t *payload = NULL;
-    size_t payload_length = 0;
-    uint32_t transaction_id = 0;
+    hid_tunnel_message_t decoded;
 
     if (
         !hid_tunnel_decode(
             frame.data,
             frame.length,
-            HID_TUNNEL_TYPE_REQUEST,
-            &transaction_id,
-            &payload,
-            &payload_length
+            &decoded
         )
     ) {
-        ESP_LOGW(TAG, "discarding invalid request frame");
+        ESP_LOGW(TAG, "discarding invalid transport frame");
         return false;
     }
 
-    memcpy(request->source, frame.source, ESP_NOW_ETH_ALEN);
-    request->transaction_id = transaction_id;
-    request->payload_length = payload_length;
-    memcpy(request->payload, payload, payload_length);
+    memcpy(message->source, frame.source, ESP_NOW_ETH_ALEN);
+    message->type = decoded.type;
+    message->request_id = decoded.request_id;
+    message->body_length = decoded.body_length;
+    memcpy(message->body, decoded.body, decoded.body_length);
 
     return true;
 }
 
 
-esp_err_t espnow_transport_send_response(
+esp_err_t espnow_transport_send_message(
     const uint8_t destination[ESP_NOW_ETH_ALEN],
-    uint32_t transaction_id,
-    const uint8_t *payload,
-    size_t payload_length
+    uint8_t type,
+    uint32_t request_id,
+    const uint8_t *body,
+    size_t body_length
 )
 {
     uint8_t frame[ESP_NOW_MAX_DATA_LEN];
@@ -140,10 +137,10 @@ esp_err_t espnow_transport_send_response(
     size_t frame_length = hid_tunnel_encode(
         frame,
         sizeof(frame),
-        HID_TUNNEL_TYPE_RESPONSE,
-        transaction_id,
-        payload,
-        payload_length
+        type,
+        request_id,
+        body,
+        body_length
     );
 
     if (frame_length == 0) {

@@ -122,18 +122,26 @@ static usb_transfer_t *battery_control_transfer = NULL;
 static usb_transfer_t *battery_input_transfer = NULL;
 
 static bool battery_transaction_active = false;
-static size_t active_request_length = 0;
-static uint32_t active_transaction_id = 0;
+static size_t active_write_length = 0;
+static uint16_t active_read_length = 0;
+static uint32_t active_read_timeout_ms = 0;
+static uint32_t active_request_id = 0;
 static uint8_t active_requester[ESP_NOW_ETH_ALEN] = {0};
 static bool active_tunnel_transaction = false;
+static bool usb_connected = false;
+static bool hid_ready = false;
+static uint16_t connected_vid = 0;
+static uint16_t connected_pid = 0;
 
 
 typedef struct {
     uint8_t destination[ESP_NOW_ETH_ALEN];
-    uint32_t transaction_id;
+    uint8_t operation;
+    uint8_t result;
+    uint32_t request_id;
     int length;
     bool tunnel_transaction;
-    uint8_t data[HID_TUNNEL_MAX_PAYLOAD];
+    uint8_t data[HID_TUNNEL_MAX_HID_BYTES];
 } hid_response_t;
 
 
@@ -1084,47 +1092,61 @@ static void show_battery_response(
 
 
 /* ============================================================
- * HID interrupt-IN callback
+ * HID completion callbacks
  *
- * USB client callback context: copy the raw response to a queue only.
+ * USB client callback context: copy completion state/data to a queue only.
  * ============================================================ */
+
+static void queue_hid_completion(
+    uint8_t operation,
+    uint8_t result,
+    const uint8_t *data,
+    int length
+)
+{
+    if (hid_response_queue != NULL) {
+        hid_response_t response = {0};
+
+        memcpy(response.destination, active_requester, ESP_NOW_ETH_ALEN);
+        response.operation = operation;
+        response.result = result;
+        response.request_id = active_request_id;
+        response.tunnel_transaction = active_tunnel_transaction;
+        response.length = length;
+
+        if (length > 0 && data != NULL) {
+            memcpy(response.data, data, length);
+        }
+
+        (void)xQueueSend(hid_response_queue, &response, 0);
+    }
+}
+
 
 static void battery_input_callback(
     usb_transfer_t *transfer
 )
 {
-    if (
-        transfer->status == USB_TRANSFER_STATUS_COMPLETED &&
-        transfer->actual_num_bytes > 0 &&
-        hid_response_queue != NULL
-    ) {
-        hid_response_t response = {0};
+    uint8_t result = transfer->status == USB_TRANSFER_STATUS_COMPLETED
+        ? HID_TUNNEL_RESULT_OK
+        : (transfer->status == USB_TRANSFER_STATUS_TIMED_OUT
+            ? HID_TUNNEL_RESULT_TIMEOUT
+            : HID_TUNNEL_RESULT_USB_ERROR);
 
-        response.length = transfer->actual_num_bytes;
+    int length = result == HID_TUNNEL_RESULT_OK
+        ? transfer->actual_num_bytes
+        : 0;
 
-        if (response.length > HID_TUNNEL_MAX_PAYLOAD) {
-            response.length = HID_TUNNEL_MAX_PAYLOAD;
-        }
-
-        memcpy(
-            response.destination,
-            active_requester,
-            ESP_NOW_ETH_ALEN
-        );
-        response.transaction_id = active_transaction_id;
-        response.tunnel_transaction = active_tunnel_transaction;
-        memcpy(
-            response.data,
-            transfer->data_buffer,
-            response.length
-        );
-
-        (void)xQueueSend(
-            hid_response_queue,
-            &response,
-            0
-        );
+    if (length > active_read_length) {
+        length = active_read_length;
     }
+
+    queue_hid_completion(
+        HID_TUNNEL_READ_RESPONSE,
+        result,
+        transfer->data_buffer,
+        length
+    );
 
     battery_transaction_active = false;
 }
@@ -1133,49 +1155,31 @@ static void battery_input_callback(
 /* ============================================================
  * HID SET_REPORT callback
  *
- * Once the opaque report has been written successfully, submit the
- * already-proven interrupt-IN transfer.
+ * SET_REPORT completion is an independent WRITE result. It does not
+ * automatically submit interrupt-IN.
  * ============================================================ */
 
 static void battery_control_callback(
     usb_transfer_t *transfer
 )
 {
-    if (
-        transfer->status != USB_TRANSFER_STATUS_COMPLETED ||
-        battery_input_transfer == NULL ||
-        hid_in_endpoint == 0 ||
-        hid_in_mps == 0
-    ) {
-        battery_transaction_active = false;
-        return;
-    }
+    uint8_t result = transfer->status == USB_TRANSFER_STATUS_COMPLETED
+        ? HID_TUNNEL_RESULT_OK
+        : HID_TUNNEL_RESULT_USB_ERROR;
 
-    battery_input_transfer->device_handle = device_hdl;
-    battery_input_transfer->bEndpointAddress = hid_in_endpoint;
-    battery_input_transfer->callback = battery_input_callback;
-    battery_input_transfer->context = NULL;
-
-    int receive_length = hid_in_mps;
-
-    while (receive_length < active_request_length) {
-        receive_length += hid_in_mps;
-    }
-
-    battery_input_transfer->num_bytes = receive_length;
-
-    esp_err_t err = usb_host_transfer_submit(
-        battery_input_transfer
+    queue_hid_completion(
+        HID_TUNNEL_WRITE_RESPONSE,
+        result,
+        NULL,
+        result == HID_TUNNEL_RESULT_OK ? active_write_length : 0
     );
 
-    if (err != ESP_OK) {
-        battery_transaction_active = false;
-    }
+    battery_transaction_active = false;
 }
 
 
 /* ============================================================
- * Start one opaque HID SET_REPORT followed by interrupt-IN.
+ * Start one opaque HID SET_REPORT.
  * ============================================================ */
 
 static esp_err_t hid_set_report_transaction(
@@ -1189,10 +1193,9 @@ static esp_err_t hid_set_report_transaction(
     if (
         device_hdl == NULL ||
         claimed_hid_interface < 0 ||
-        hid_in_endpoint == 0 ||
         request == NULL ||
         request_length == 0 ||
-        request_length > HID_TUNNEL_MAX_PAYLOAD
+        request_length > HID_TUNNEL_MAX_HID_BYTES
     ) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -1203,27 +1206,9 @@ static esp_err_t hid_set_report_transaction(
 
     if (battery_control_transfer == NULL) {
         esp_err_t err = usb_host_transfer_alloc(
-            8 + HID_TUNNEL_MAX_PAYLOAD,
+            8 + HID_TUNNEL_MAX_HID_BYTES,
             0,
             &battery_control_transfer
-        );
-
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-
-    int receive_capacity = hid_in_mps;
-
-    while (receive_capacity < HID_TUNNEL_MAX_PAYLOAD) {
-        receive_capacity += hid_in_mps;
-    }
-
-    if (battery_input_transfer == NULL) {
-        esp_err_t err = usb_host_transfer_alloc(
-            receive_capacity,
-            0,
-            &battery_input_transfer
         );
 
         if (err != ESP_OK) {
@@ -1250,8 +1235,8 @@ static esp_err_t hid_set_report_transaction(
     battery_control_transfer->context = NULL;
     battery_control_transfer->num_bytes = 8 + request_length;
 
-    active_request_length = request_length;
-    active_transaction_id = transaction_id;
+    active_write_length = request_length;
+    active_request_id = transaction_id;
     active_tunnel_transaction = tunnel_transaction;
 
     if (requester != NULL) {
@@ -1267,6 +1252,76 @@ static esp_err_t hid_set_report_transaction(
         client_hdl,
         battery_control_transfer
     );
+
+    if (err != ESP_OK) {
+        battery_transaction_active = false;
+    }
+
+    return err;
+}
+
+
+/* Start one independent interrupt-IN read. */
+static esp_err_t hid_interrupt_read(
+    uint16_t requested_length,
+    uint32_t timeout_ms,
+    const uint8_t requester[ESP_NOW_ETH_ALEN],
+    uint32_t request_id
+)
+{
+    if (
+        device_hdl == NULL ||
+        claimed_hid_interface < 0 ||
+        hid_in_endpoint == 0 ||
+        hid_in_mps == 0 ||
+        requested_length == 0 ||
+        requested_length > HID_TUNNEL_MAX_HID_BYTES
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (battery_transaction_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int receive_capacity = hid_in_mps;
+
+    while (receive_capacity < HID_TUNNEL_MAX_HID_BYTES) {
+        receive_capacity += hid_in_mps;
+    }
+
+    if (battery_input_transfer == NULL) {
+        esp_err_t err = usb_host_transfer_alloc(
+            receive_capacity,
+            0,
+            &battery_input_transfer
+        );
+
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    int receive_length = hid_in_mps;
+
+    while (receive_length < requested_length) {
+        receive_length += hid_in_mps;
+    }
+
+    battery_input_transfer->device_handle = device_hdl;
+    battery_input_transfer->bEndpointAddress = hid_in_endpoint;
+    battery_input_transfer->callback = battery_input_callback;
+    battery_input_transfer->context = NULL;
+    battery_input_transfer->num_bytes = receive_length;
+
+    active_read_length = requested_length;
+    active_read_timeout_ms = timeout_ms;
+    active_request_id = request_id;
+    active_tunnel_transaction = true;
+    memcpy(active_requester, requester, ESP_NOW_ETH_ALEN);
+    battery_transaction_active = true;
+
+    esp_err_t err = usb_host_transfer_submit(battery_input_transfer);
 
     if (err != ESP_OK) {
         battery_transaction_active = false;
@@ -1401,6 +1456,8 @@ static void inspect_usb_device(
         return;
     }
 
+    usb_connected = true;
+
 
     const usb_device_desc_t *dev_desc =
         NULL;
@@ -1425,6 +1482,9 @@ static void inspect_usb_device(
 
         return;
     }
+
+    connected_vid = dev_desc->idVendor;
+    connected_pid = dev_desc->idProduct;
 
 
     usb_device_info_t info = {0};
@@ -1579,6 +1639,8 @@ static void inspect_usb_device(
 
     hid_in_mps =
         hid.in_mps;
+
+    hid_ready = true;
 
 
     screen_printf(
@@ -1950,19 +2012,38 @@ void app_main(void)
                 0
             ) == pdTRUE
         ) {
-            show_battery_response(
-                hid_response.data,
-                hid_response.length
-            );
-
             if (hid_response.tunnel_transaction) {
-                esp_err_t send_err =
-                    espnow_transport_send_response(
-                        hid_response.destination,
-                        hid_response.transaction_id,
+                uint8_t body[HID_TUNNEL_MAX_BODY];
+                size_t body_length = 0;
+
+                body[0] = hid_response.result;
+                hid_tunnel_put_u16(&body[1], hid_response.length);
+                body_length = HID_TUNNEL_READ_RESPONSE_OVERHEAD;
+
+                if (
+                    hid_response.operation == HID_TUNNEL_READ_RESPONSE &&
+                    hid_response.result == HID_TUNNEL_RESULT_OK
+                ) {
+                    memcpy(
+                        &body[HID_TUNNEL_READ_RESPONSE_OVERHEAD],
                         hid_response.data,
                         hid_response.length
                     );
+                    body_length += hid_response.length;
+
+                    show_battery_response(
+                        hid_response.data,
+                        hid_response.length
+                    );
+                }
+
+                esp_err_t send_err = espnow_transport_send_message(
+                    hid_response.destination,
+                    hid_response.operation,
+                    hid_response.request_id,
+                    body,
+                    body_length
+                );
 
                 if (send_err != ESP_OK) {
                     ESP_LOGE(
@@ -1975,33 +2056,124 @@ void app_main(void)
         }
 
 
-        if (
-            !battery_transaction_active &&
-            device_hdl != NULL &&
-            claimed_hid_interface >= 0
-        ) {
-            espnow_hid_request_t request;
+        espnow_hid_message_t request;
 
-            if (
-                espnow_transport_receive_request(
-                    &request,
-                    0
-                )
-            ) {
-                esp_err_t hid_err =
-                    hid_set_report_transaction(
-                        request.payload,
-                        request.payload_length,
+        if (espnow_transport_receive_message(&request, 0)) {
+            uint8_t result = HID_TUNNEL_RESULT_OK;
+            uint8_t response_type = 0;
+            uint8_t response_body[HID_TUNNEL_STATUS_RESPONSE_SIZE] = {0};
+            size_t response_length = 0;
+            bool send_immediate_response = false;
+
+            if (request.type == HID_TUNNEL_WRITE_REQUEST) {
+                response_type = HID_TUNNEL_WRITE_RESPONSE;
+            }
+            else if (request.type == HID_TUNNEL_READ_REQUEST) {
+                response_type = HID_TUNNEL_READ_RESPONSE;
+            }
+
+            if (request.type == HID_TUNNEL_STATUS_REQUEST) {
+                response_type = HID_TUNNEL_STATUS_RESPONSE;
+                response_body[0] = usb_connected;
+                response_body[1] = hid_ready;
+                hid_tunnel_put_u16(&response_body[2], connected_vid);
+                hid_tunnel_put_u16(&response_body[4], connected_pid);
+                response_length = HID_TUNNEL_STATUS_RESPONSE_SIZE;
+                send_immediate_response = true;
+            }
+            else if (battery_transaction_active) {
+                result = HID_TUNNEL_RESULT_BUSY;
+            }
+            else if (!usb_connected || !hid_ready) {
+                result = HID_TUNNEL_RESULT_NO_DEVICE;
+            }
+            else if (request.type == HID_TUNNEL_WRITE_REQUEST) {
+                if (
+                    request.body_length == 0 ||
+                    request.body_length > HID_TUNNEL_MAX_HID_BYTES
+                ) {
+                    result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+                }
+                else {
+                    esp_err_t hid_err = hid_set_report_transaction(
+                        request.body,
+                        request.body_length,
                         request.source,
-                        request.transaction_id,
+                        request.request_id,
                         true
                     );
 
-                if (hid_err != ESP_OK) {
+                    if (hid_err == ESP_OK) {
+                        continue;
+                    }
+
+                    result = HID_TUNNEL_RESULT_USB_ERROR;
+                }
+            }
+            else if (request.type == HID_TUNNEL_READ_REQUEST) {
+                if (request.body_length != HID_TUNNEL_READ_REQUEST_SIZE) {
+                    result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+                }
+                else {
+                    uint16_t requested_length =
+                        hid_tunnel_get_u16(request.body);
+                    uint32_t timeout_ms =
+                        hid_tunnel_get_u32(&request.body[2]);
+
+                    if (
+                        requested_length == 0 ||
+                        requested_length > HID_TUNNEL_MAX_HID_BYTES ||
+                        timeout_ms == 0
+                    ) {
+                        result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+                    }
+                    else {
+                        esp_err_t hid_err = hid_interrupt_read(
+                            requested_length,
+                            timeout_ms,
+                            request.source,
+                            request.request_id
+                        );
+
+                        if (hid_err == ESP_OK) {
+                            ESP_LOGI(
+                                TAG,
+                                "READ %u bytes, timeout %lu ms",
+                                requested_length,
+                                (unsigned long)active_read_timeout_ms
+                            );
+                            continue;
+                        }
+
+                        result = HID_TUNNEL_RESULT_USB_ERROR;
+                    }
+                }
+            }
+            else {
+                result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+            }
+
+            if (!send_immediate_response) {
+                response_body[0] = result;
+                hid_tunnel_put_u16(&response_body[1], 0);
+                response_length = HID_TUNNEL_READ_RESPONSE_OVERHEAD;
+                send_immediate_response = response_type != 0;
+            }
+
+            if (send_immediate_response) {
+                esp_err_t send_err = espnow_transport_send_message(
+                    request.source,
+                    response_type,
+                    request.request_id,
+                    response_body,
+                    response_length
+                );
+
+                if (send_err != ESP_OK) {
                     ESP_LOGE(
                         TAG,
-                        "HID tunnel request: %s",
-                        esp_err_to_name(hid_err)
+                        "ESP-NOW operation response: %s",
+                        esp_err_to_name(send_err)
                     );
                 }
             }
@@ -2041,6 +2213,10 @@ void app_main(void)
             device_gone = false;
             battery_transaction_active = false;
             xQueueReset(hid_response_queue);
+            usb_connected = false;
+            hid_ready = false;
+            connected_vid = 0;
+            connected_pid = 0;
 
 
             if (

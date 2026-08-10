@@ -3,92 +3,124 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
+#define HID_TUNNEL_MAGIC                   0xD1
+#define HID_TUNNEL_HEADER_SIZE             8
+#define HID_TUNNEL_MAX_BODY                242
+#define HID_TUNNEL_MAX_HID_BYTES           239
 
-#define HID_TUNNEL_MAGIC               0xD1
-#define HID_TUNNEL_TYPE_REQUEST        0x01
-#define HID_TUNNEL_TYPE_RESPONSE       0x02
-#define HID_TUNNEL_HEADER_SIZE         8
-#define HID_TUNNEL_MAX_PAYLOAD         242
+#define HID_TUNNEL_WRITE_REQUEST           0x01
+#define HID_TUNNEL_WRITE_RESPONSE          0x02
+#define HID_TUNNEL_READ_REQUEST            0x03
+#define HID_TUNNEL_READ_RESPONSE           0x04
+#define HID_TUNNEL_STATUS_REQUEST          0x05
+#define HID_TUNNEL_STATUS_RESPONSE         0x06
 
+#define HID_TUNNEL_RESULT_OK               0x00
+#define HID_TUNNEL_RESULT_TIMEOUT          0x01
+#define HID_TUNNEL_RESULT_NO_DEVICE        0x02
+#define HID_TUNNEL_RESULT_BUSY             0x03
+#define HID_TUNNEL_RESULT_INVALID_REQUEST  0x04
+#define HID_TUNNEL_RESULT_USB_ERROR        0x05
+
+#define HID_TUNNEL_WRITE_RESPONSE_SIZE     3
+#define HID_TUNNEL_READ_REQUEST_SIZE       6
+#define HID_TUNNEL_READ_RESPONSE_OVERHEAD  3
+#define HID_TUNNEL_STATUS_RESPONSE_SIZE    6
+
+typedef struct {
+    uint8_t type;
+    uint32_t request_id;
+    const uint8_t *body;
+    size_t body_length;
+} hid_tunnel_message_t;
+
+static inline uint16_t hid_tunnel_get_u16(const uint8_t *data)
+{
+    return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
+}
+
+static inline uint32_t hid_tunnel_get_u32(const uint8_t *data)
+{
+    return
+        (uint32_t)data[0] |
+        ((uint32_t)data[1] << 8) |
+        ((uint32_t)data[2] << 16) |
+        ((uint32_t)data[3] << 24);
+}
+
+static inline void hid_tunnel_put_u16(uint8_t *data, uint16_t value)
+{
+    data[0] = value & 0xFF;
+    data[1] = (value >> 8) & 0xFF;
+}
+
+static inline void hid_tunnel_put_u32(uint8_t *data, uint32_t value)
+{
+    data[0] = value & 0xFF;
+    data[1] = (value >> 8) & 0xFF;
+    data[2] = (value >> 16) & 0xFF;
+    data[3] = (value >> 24) & 0xFF;
+}
 
 static inline size_t hid_tunnel_encode(
     uint8_t *frame,
     size_t frame_capacity,
     uint8_t type,
-    uint32_t transaction_id,
-    const uint8_t *payload,
-    size_t payload_length
+    uint32_t request_id,
+    const uint8_t *body,
+    size_t body_length
 )
 {
     if (
         frame == NULL ||
-        payload == NULL ||
-        payload_length == 0 ||
-        payload_length > HID_TUNNEL_MAX_PAYLOAD ||
-        frame_capacity < HID_TUNNEL_HEADER_SIZE + payload_length
+        body_length > HID_TUNNEL_MAX_BODY ||
+        (body_length > 0 && body == NULL) ||
+        frame_capacity < HID_TUNNEL_HEADER_SIZE + body_length
     ) {
         return 0;
     }
 
     frame[0] = HID_TUNNEL_MAGIC;
     frame[1] = type;
-    frame[2] = transaction_id & 0xFF;
-    frame[3] = (transaction_id >> 8) & 0xFF;
-    frame[4] = (transaction_id >> 16) & 0xFF;
-    frame[5] = (transaction_id >> 24) & 0xFF;
-    frame[6] = payload_length & 0xFF;
-    frame[7] = (payload_length >> 8) & 0xFF;
+    hid_tunnel_put_u32(&frame[2], request_id);
+    hid_tunnel_put_u16(&frame[6], body_length);
 
-    for (size_t i = 0; i < payload_length; i++) {
-        frame[HID_TUNNEL_HEADER_SIZE + i] = payload[i];
+    if (body_length > 0) {
+        memcpy(&frame[HID_TUNNEL_HEADER_SIZE], body, body_length);
     }
 
-    return HID_TUNNEL_HEADER_SIZE + payload_length;
+    return HID_TUNNEL_HEADER_SIZE + body_length;
 }
-
 
 static inline bool hid_tunnel_decode(
     const uint8_t *frame,
     size_t frame_length,
-    uint8_t expected_type,
-    uint32_t *transaction_id,
-    const uint8_t **payload,
-    size_t *payload_length
+    hid_tunnel_message_t *message
 )
 {
     if (
         frame == NULL ||
-        transaction_id == NULL ||
-        payload == NULL ||
-        payload_length == NULL ||
+        message == NULL ||
         frame_length < HID_TUNNEL_HEADER_SIZE ||
-        frame[0] != HID_TUNNEL_MAGIC ||
-        frame[1] != expected_type
+        frame[0] != HID_TUNNEL_MAGIC
     ) {
         return false;
     }
 
-    size_t decoded_length =
-        (size_t)frame[6] |
-        ((size_t)frame[7] << 8);
+    size_t body_length = hid_tunnel_get_u16(&frame[6]);
 
     if (
-        decoded_length == 0 ||
-        decoded_length > HID_TUNNEL_MAX_PAYLOAD ||
-        frame_length != HID_TUNNEL_HEADER_SIZE + decoded_length
+        body_length > HID_TUNNEL_MAX_BODY ||
+        frame_length != HID_TUNNEL_HEADER_SIZE + body_length
     ) {
         return false;
     }
 
-    *transaction_id =
-        (uint32_t)frame[2] |
-        ((uint32_t)frame[3] << 8) |
-        ((uint32_t)frame[4] << 16) |
-        ((uint32_t)frame[5] << 24);
-
-    *payload = &frame[HID_TUNNEL_HEADER_SIZE];
-    *payload_length = decoded_length;
-
+    message->type = frame[1];
+    message->request_id = hid_tunnel_get_u32(&frame[2]);
+    message->body = &frame[HID_TUNNEL_HEADER_SIZE];
+    message->body_length = body_length;
     return true;
 }
