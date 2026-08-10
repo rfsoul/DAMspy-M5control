@@ -21,6 +21,8 @@
 #include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"
 
+#include "espnow_echo.h"
+
 
 /* ============================================================
  * IDs
@@ -1461,7 +1463,7 @@ static void usb_client_event_cb(
 
 
 /* ============================================================
- * Inspect device and start battery request
+ * Inspect device and prepare the HID interface
  * ============================================================ */
 
 static void inspect_usb_device(
@@ -1686,7 +1688,7 @@ static void inspect_usb_device(
         "HID IF %d\n"
         "IN EP 0x%02X MPS %u\n\n"
         "Core: %d%% %.3fV\n\n"
-        "Reading battery...",
+        "HID ready",
         dev_desc->idVendor,
         dev_desc->idProduct,
         product,
@@ -1700,8 +1702,8 @@ static void inspect_usb_device(
 
 
     /*
-     * Only send our proprietary command to the exact product
-     * we have identified.
+     * Keep the known-good Wireless PRO battery request and parser above
+     * as diagnostic code, but do not trigger the request automatically.
      */
 
     if (
@@ -1711,25 +1713,22 @@ static void inspect_usb_device(
             WIRELESS_PRO_RX_PID
     ) {
 
-        vTaskDelay(
-            pdMS_TO_TICKS(200)
+        screen_printf(
+            "WIRELESS PRO READY\n\n"
+            "VID %04X PID %04X\n"
+            "%s\n"
+            "SN: %s\n\n"
+            "HID IF %d\n"
+            "IN EP 0x%02X MPS %u\n\n"
+            "Waiting for tunnel test",
+            dev_desc->idVendor,
+            dev_desc->idProduct,
+            product,
+            serial,
+            hid.interface_number,
+            hid.in_endpoint,
+            hid.in_mps
         );
-
-
-        err =
-            wireless_pro_read_battery();
-
-
-        if (err != ESP_OK) {
-
-            screen_printf(
-                "WIRELESS PRO\n\n"
-                "Battery request\n"
-                "could not start\n\n"
-                "%s",
-                esp_err_to_name(err)
-            );
-        }
     }
     else {
 
@@ -1902,6 +1901,20 @@ void app_main(void)
 
 
     cores3_usb_power(true);
+
+
+    /* --------------------------------------------------------
+     * ESP-NOW stage-one opaque echo transport
+     * -------------------------------------------------------- */
+
+    err = espnow_echo_start();
+
+    if (err != ESP_OK) {
+        fatal_error(
+            "ESP-NOW echo",
+            err
+        );
+    }
 
 
     /* --------------------------------------------------------
