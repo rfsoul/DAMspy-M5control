@@ -18,6 +18,8 @@
 
 #include "M5GFX.h"
 
+#include "hid_tunnel_protocol.h"
+
 
 #define ESPNOW_CHANNEL         6
 #define ECHO_TIMEOUT_MS        5000
@@ -38,10 +40,10 @@ static const uint8_t broadcast_address[ESP_NOW_ETH_ALEN] = {
 };
 
 static const uint8_t test_frame[] = {
-    0x00, 0x01, 0x61, 0x7F,
-    0x80, 0xA5, 0x5A, 0xFF,
-    0x10, 0x20, 0x30, 0x40,
-    0xDE, 0xAD, 0xBE, 0xEF
+    0x01, 0x61,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00
 };
 
 static QueueHandle_t receive_queue = NULL;
@@ -286,7 +288,7 @@ extern "C" void app_main(void)
     );
 
     printf(
-        "M5StickS3 ESP-NOW echo test\n"
+        "M5StickS3 HID tunnel test\n"
         "Channel: %d\n"
         "Station MAC: " MACSTR "\n",
         ESPNOW_CHANNEL,
@@ -303,13 +305,26 @@ extern "C" void app_main(void)
         test_count++;
         xQueueReset(receive_queue);
 
-        print_hex("TX", test_frame, sizeof(test_frame));
-
-        err = esp_now_send(
-            broadcast_address,
+        uint8_t request_frame[ESP_NOW_MAX_DATA_LEN];
+        size_t request_frame_length = hid_tunnel_encode(
+            request_frame,
+            sizeof(request_frame),
+            HID_TUNNEL_TYPE_REQUEST,
+            test_count,
             test_frame,
             sizeof(test_frame)
         );
+
+        print_hex("TX HID", test_frame, sizeof(test_frame));
+        printf("Transaction: %lu\n", (unsigned long)test_count);
+
+        err = request_frame_length > 0
+            ? esp_now_send(
+                broadcast_address,
+                request_frame,
+                request_frame_length
+            )
+            : ESP_ERR_INVALID_SIZE;
 
         if (err != ESP_OK) {
             fail_count++;
@@ -323,12 +338,12 @@ extern "C" void app_main(void)
             continue;
         }
 
-        received_frame_t echo;
+        received_frame_t received;
 
         if (
             xQueueReceive(
                 receive_queue,
-                &echo,
+                &received,
                 pdMS_TO_TICKS(ECHO_TIMEOUT_MS)
             ) != pdTRUE
         ) {
@@ -343,39 +358,73 @@ extern "C" void app_main(void)
             continue;
         }
 
-        printf("Echo source: " MACSTR "\n", MAC2STR(echo.source));
-        print_hex("RX", echo.data, echo.length);
+        const uint8_t *response_payload = NULL;
+        size_t response_length = 0;
+        uint32_t response_transaction_id = 0;
 
-        bool length_matches =
-            echo.length == sizeof(test_frame);
+        bool frame_valid = hid_tunnel_decode(
+            received.data,
+            received.length,
+            HID_TUNNEL_TYPE_RESPONSE,
+            &response_transaction_id,
+            &response_payload,
+            &response_length
+        );
 
-        bool data_matches =
-            length_matches &&
-            memcmp(
-                echo.data,
-                test_frame,
-                sizeof(test_frame)
-            ) == 0;
+        printf("Response source: " MACSTR "\n", MAC2STR(received.source));
 
-        if (data_matches) {
+        if (frame_valid) {
+            printf(
+                "Response transaction: %lu\n",
+                (unsigned long)response_transaction_id
+            );
+            print_hex("RX HID", response_payload, response_length);
+        }
+        else {
+            print_hex("RX FRAME", received.data, received.length);
+        }
+
+        bool transaction_matches =
+            frame_valid &&
+            response_transaction_id == test_count;
+
+        bool response_prefix_valid =
+            transaction_matches &&
+            response_length >= 3 &&
+            response_payload[0] == 0x02 &&
+            response_payload[1] == 0x61 &&
+            response_payload[2] == 0x41;
+
+        if (response_prefix_valid) {
             pass_count++;
             printf("RESULT: PASS\n");
             show_result(
                 test_count, pass_count, fail_count,
-                echo.length, true, ""
+                response_length, true, ""
             );
         }
         else {
             fail_count++;
-            const char *reason =
-                length_matches
-                ? "DATA MISMATCH"
-                : "LENGTH";
+            const char *reason;
+
+            if (!frame_valid) {
+                reason = "FRAME";
+            }
+            else if (!transaction_matches) {
+                reason = "TRANSACTION";
+            }
+            else if (response_length < 3) {
+                reason = "LENGTH";
+            }
+            else {
+                reason = "BAD PREFIX";
+            }
 
             printf("RESULT: FAIL (%s)\n", reason);
             show_result(
                 test_count, pass_count, fail_count,
-                echo.length, false, reason
+                frame_valid ? response_length : -1,
+                false, reason
             );
         }
 

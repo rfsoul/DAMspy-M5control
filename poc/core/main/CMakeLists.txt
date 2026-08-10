@@ -9,4 +9,5 @@ idf_component_register(
         esp_event
         esp_netif
         nvs_flash
+        hid_tunnel_protocol
 )

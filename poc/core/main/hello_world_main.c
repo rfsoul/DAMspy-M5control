@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
@@ -121,6 +122,22 @@ static usb_transfer_t *battery_control_transfer = NULL;
 static usb_transfer_t *battery_input_transfer = NULL;
 
 static bool battery_transaction_active = false;
+static size_t active_request_length = 0;
+static uint32_t active_transaction_id = 0;
+static uint8_t active_requester[ESP_NOW_ETH_ALEN] = {0};
+static bool active_tunnel_transaction = false;
+
+
+typedef struct {
+    uint8_t destination[ESP_NOW_ETH_ALEN];
+    uint32_t transaction_id;
+    int length;
+    bool tunnel_transaction;
+    uint8_t data[HID_TUNNEL_MAX_PAYLOAD];
+} hid_response_t;
+
+
+static QueueHandle_t hid_response_queue = NULL;
 
 
 /* ============================================================
@@ -1067,58 +1084,57 @@ static void show_battery_response(
 
 
 /* ============================================================
- * HID battery IN callback
+ * HID interrupt-IN callback
+ *
+ * USB client callback context: copy the raw response to a queue only.
  * ============================================================ */
 
 static void battery_input_callback(
     usb_transfer_t *transfer
 )
 {
+    if (
+        transfer->status == USB_TRANSFER_STATUS_COMPLETED &&
+        transfer->actual_num_bytes > 0 &&
+        hid_response_queue != NULL
+    ) {
+        hid_response_t response = {0};
+
+        response.length = transfer->actual_num_bytes;
+
+        if (response.length > HID_TUNNEL_MAX_PAYLOAD) {
+            response.length = HID_TUNNEL_MAX_PAYLOAD;
+        }
+
+        memcpy(
+            response.destination,
+            active_requester,
+            ESP_NOW_ETH_ALEN
+        );
+        response.transaction_id = active_transaction_id;
+        response.tunnel_transaction = active_tunnel_transaction;
+        memcpy(
+            response.data,
+            transfer->data_buffer,
+            response.length
+        );
+
+        (void)xQueueSend(
+            hid_response_queue,
+            &response,
+            0
+        );
+    }
+
     battery_transaction_active = false;
-
-
-    if (
-        transfer->status !=
-        USB_TRANSFER_STATUS_COMPLETED
-    ) {
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY READ FAILED\n\n"
-            "USB status: %d",
-            transfer->status
-        );
-
-        return;
-    }
-
-
-    if (
-        transfer->actual_num_bytes <= 0
-    ) {
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY READ FAILED\n\n"
-            "No response bytes"
-        );
-
-        return;
-    }
-
-
-    show_battery_response(
-        transfer->data_buffer,
-        transfer->actual_num_bytes
-    );
 }
 
 
 /* ============================================================
  * HID SET_REPORT callback
  *
- * Once the battery request has been written successfully,
- * start polling the Wireless PRO interrupt IN endpoint.
+ * Once the opaque report has been written successfully, submit the
+ * already-proven interrupt-IN transfer.
  * ============================================================ */
 
 static void battery_control_callback(
@@ -1126,268 +1142,153 @@ static void battery_control_callback(
 )
 {
     if (
-        transfer->status !=
-        USB_TRANSFER_STATUS_COMPLETED
-    ) {
-
-        battery_transaction_active = false;
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY COMMAND FAILED\n\n"
-            "SET_REPORT status: %d",
-            transfer->status
-        );
-
-        return;
-    }
-
-
-    if (
+        transfer->status != USB_TRANSFER_STATUS_COMPLETED ||
         battery_input_transfer == NULL ||
         hid_in_endpoint == 0 ||
         hid_in_mps == 0
     ) {
-
         battery_transaction_active = false;
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY COMMAND SENT\n\n"
-            "But no HID IN endpoint"
-        );
-
         return;
     }
 
-
-    battery_input_transfer->device_handle =
-        device_hdl;
-
-    battery_input_transfer->bEndpointAddress =
-        hid_in_endpoint;
-
-    battery_input_transfer->callback =
-        battery_input_callback;
-
-    battery_input_transfer->context =
-        NULL;
-
-
-    /*
-     * For an IN transfer ESP-IDF requires num_bytes to be
-     * an integer multiple of endpoint MPS.
-     */
+    battery_input_transfer->device_handle = device_hdl;
+    battery_input_transfer->bEndpointAddress = hid_in_endpoint;
+    battery_input_transfer->callback = battery_input_callback;
+    battery_input_transfer->context = NULL;
 
     int receive_length = hid_in_mps;
 
-    while (
-        receive_length <
-        BATTERY_REQUEST_LENGTH
-    ) {
+    while (receive_length < active_request_length) {
         receive_length += hid_in_mps;
     }
 
+    battery_input_transfer->num_bytes = receive_length;
 
-    battery_input_transfer->num_bytes =
-        receive_length;
-
-
-    esp_err_t err =
-        usb_host_transfer_submit(
-            battery_input_transfer
-        );
-
+    esp_err_t err = usb_host_transfer_submit(
+        battery_input_transfer
+    );
 
     if (err != ESP_OK) {
-
         battery_transaction_active = false;
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY COMMAND SENT\n\n"
-            "IN submit failed:\n"
-            "%s",
-            esp_err_to_name(err)
-        );
-
-        return;
     }
-
-
-    screen_printf(
-        "WIRELESS PRO\n\n"
-        "Battery request sent\n\n"
-        "TX:\n"
-        "01 61 00 00 00 00 00 00\n"
-        "00 00 00 00 00 00 00 00 00\n\n"
-        "Waiting for response..."
-    );
 }
 
 
 /* ============================================================
- * Start Wireless PRO battery request
- *
- * HIDAPI performs this as:
- *
- * bmRequestType = 0x21
- * bRequest      = 0x09      SET_REPORT
- * wValue        = 0x0201    OUTPUT report, ID 1
- * wIndex        = HID interface
- * wLength       = 17
- *
- * Data stage is our 17-byte battery request.
+ * Start one opaque HID SET_REPORT followed by interrupt-IN.
  * ============================================================ */
 
-static esp_err_t wireless_pro_read_battery(void)
+static esp_err_t hid_set_report_transaction(
+    const uint8_t *request,
+    size_t request_length,
+    const uint8_t requester[ESP_NOW_ETH_ALEN],
+    uint32_t transaction_id,
+    bool tunnel_transaction
+)
 {
     if (
         device_hdl == NULL ||
         claimed_hid_interface < 0 ||
-        hid_in_endpoint == 0
+        hid_in_endpoint == 0 ||
+        request == NULL ||
+        request_length == 0 ||
+        request_length > HID_TUNNEL_MAX_PAYLOAD
     ) {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_ARG;
     }
-
 
     if (battery_transaction_active) {
         return ESP_ERR_INVALID_STATE;
     }
 
-
-    /*
-     * Control transfer:
-     *
-     * 8-byte setup packet
-     * + 17 byte HID report.
-     */
-
     if (battery_control_transfer == NULL) {
-
-        esp_err_t err =
-            usb_host_transfer_alloc(
-                8 +
-                BATTERY_REQUEST_LENGTH,
-                0,
-                &battery_control_transfer
-            );
+        esp_err_t err = usb_host_transfer_alloc(
+            8 + HID_TUNNEL_MAX_PAYLOAD,
+            0,
+            &battery_control_transfer
+        );
 
         if (err != ESP_OK) {
             return err;
         }
     }
 
+    int receive_capacity = hid_in_mps;
 
-    /*
-     * Allocate enough interrupt-IN space.
-     */
-
-    int receive_length = hid_in_mps;
-
-    while (
-        receive_length <
-        BATTERY_REQUEST_LENGTH
-    ) {
-        receive_length += hid_in_mps;
+    while (receive_capacity < HID_TUNNEL_MAX_PAYLOAD) {
+        receive_capacity += hid_in_mps;
     }
-
 
     if (battery_input_transfer == NULL) {
-
-        esp_err_t err =
-            usb_host_transfer_alloc(
-                receive_length,
-                0,
-                &battery_input_transfer
-            );
+        esp_err_t err = usb_host_transfer_alloc(
+            receive_capacity,
+            0,
+            &battery_input_transfer
+        );
 
         if (err != ESP_OK) {
             return err;
         }
     }
 
-
-    uint8_t *buf =
-        battery_control_transfer->data_buffer;
-
-
-    /*
-     * USB SETUP packet, little endian.
-     *
-     * 0: bmRequestType = 0x21
-     *      host -> device
-     *      class request
-     *      interface recipient
-     *
-     * 1: bRequest = 0x09 = HID SET_REPORT
-     *
-     * 2/3: wValue = 0x0201
-     *      report type 2 = OUTPUT
-     *      report ID 1
-     *
-     * 4/5: wIndex = HID interface
-     *
-     * 6/7: wLength = 17
-     */
+    uint8_t *buf = battery_control_transfer->data_buffer;
 
     buf[0] = 0x21;
     buf[1] = 0x09;
-
-    buf[2] = BATTERY_REPORT_ID;
+    buf[2] = request[0];
     buf[3] = 0x02;
-
-    buf[4] =
-        claimed_hid_interface & 0xFF;
-
+    buf[4] = claimed_hid_interface & 0xFF;
     buf[5] = 0x00;
+    buf[6] = request_length & 0xFF;
+    buf[7] = (request_length >> 8) & 0xFF;
 
-    buf[6] =
-        BATTERY_REQUEST_LENGTH & 0xFF;
+    memcpy(&buf[8], request, request_length);
 
-    buf[7] = 0x00;
+    battery_control_transfer->device_handle = device_hdl;
+    battery_control_transfer->bEndpointAddress = 0x00;
+    battery_control_transfer->callback = battery_control_callback;
+    battery_control_transfer->context = NULL;
+    battery_control_transfer->num_bytes = 8 + request_length;
 
+    active_request_length = request_length;
+    active_transaction_id = transaction_id;
+    active_tunnel_transaction = tunnel_transaction;
 
-    memcpy(
-        &buf[8],
-        wireless_pro_battery_request,
-        BATTERY_REQUEST_LENGTH
-    );
-
-
-    battery_control_transfer->device_handle =
-        device_hdl;
-
-    battery_control_transfer->bEndpointAddress =
-        0x00;
-
-    battery_control_transfer->callback =
-        battery_control_callback;
-
-    battery_control_transfer->context =
-        NULL;
-
-    battery_control_transfer->num_bytes =
-        8 +
-        BATTERY_REQUEST_LENGTH;
-
+    if (requester != NULL) {
+        memcpy(active_requester, requester, ESP_NOW_ETH_ALEN);
+    }
+    else {
+        memset(active_requester, 0, ESP_NOW_ETH_ALEN);
+    }
 
     battery_transaction_active = true;
 
-
-    esp_err_t err =
-        usb_host_transfer_submit_control(
-            client_hdl,
-            battery_control_transfer
-        );
-
+    esp_err_t err = usb_host_transfer_submit_control(
+        client_hdl,
+        battery_control_transfer
+    );
 
     if (err != ESP_OK) {
         battery_transaction_active = false;
     }
 
-
     return err;
+}
+
+
+/*
+ * Preserved known-good diagnostic entry point. It is not triggered
+ * automatically; the tunnel supplies this same payload for testing.
+ */
+static esp_err_t wireless_pro_read_battery(void)
+{
+    return hid_set_report_transaction(
+        wireless_pro_battery_request,
+        sizeof(wireless_pro_battery_request),
+        NULL,
+        0,
+        false
+    );
 }
 
 
@@ -1904,14 +1805,23 @@ void app_main(void)
 
 
     /* --------------------------------------------------------
-     * ESP-NOW stage-one opaque echo transport
+     * ESP-NOW opaque HID transport
      * -------------------------------------------------------- */
 
-    err = espnow_echo_start();
+    hid_response_queue = xQueueCreate(
+        2,
+        sizeof(hid_response_t)
+    );
+
+    if (hid_response_queue == NULL) {
+        fatal_error("HID response queue", ESP_ERR_NO_MEM);
+    }
+
+    err = espnow_transport_start();
 
     if (err != ESP_OK) {
         fatal_error(
-            "ESP-NOW echo",
+            "ESP-NOW transport",
             err
         );
     }
@@ -2031,6 +1941,73 @@ void app_main(void)
         }
 
 
+        hid_response_t hid_response;
+
+        while (
+            xQueueReceive(
+                hid_response_queue,
+                &hid_response,
+                0
+            ) == pdTRUE
+        ) {
+            show_battery_response(
+                hid_response.data,
+                hid_response.length
+            );
+
+            if (hid_response.tunnel_transaction) {
+                esp_err_t send_err =
+                    espnow_transport_send_response(
+                        hid_response.destination,
+                        hid_response.transaction_id,
+                        hid_response.data,
+                        hid_response.length
+                    );
+
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "ESP-NOW response: %s",
+                        esp_err_to_name(send_err)
+                    );
+                }
+            }
+        }
+
+
+        if (
+            !battery_transaction_active &&
+            device_hdl != NULL &&
+            claimed_hid_interface >= 0
+        ) {
+            espnow_hid_request_t request;
+
+            if (
+                espnow_transport_receive_request(
+                    &request,
+                    0
+                )
+            ) {
+                esp_err_t hid_err =
+                    hid_set_report_transaction(
+                        request.payload,
+                        request.payload_length,
+                        request.source,
+                        request.transaction_id,
+                        true
+                    );
+
+                if (hid_err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "HID tunnel request: %s",
+                        esp_err_to_name(hid_err)
+                    );
+                }
+            }
+        }
+
+
         /*
          * New USB device
          */
@@ -2063,6 +2040,7 @@ void app_main(void)
 
             device_gone = false;
             battery_transaction_active = false;
+            xQueueReset(hid_response_queue);
 
 
             if (

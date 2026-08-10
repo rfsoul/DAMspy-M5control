@@ -4,7 +4,6 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
-#include "freertos/task.h"
 
 #include "esp_err.h"
 #include "esp_event.h"
@@ -29,15 +28,12 @@ typedef struct {
 } espnow_frame_t;
 
 
-static const char *TAG = "espnow_echo";
+static const char *TAG = "espnow_transport";
 
 static QueueHandle_t receive_queue = NULL;
 
 
-/*
- * Runs in the Wi-Fi task. Copy only; peer management and transmission
- * are deliberately left to espnow_echo_task().
- */
+/* Wi-Fi task context: validate, copy, and queue only. */
 static void espnow_receive_callback(
     const esp_now_recv_info_t *info,
     const uint8_t *data,
@@ -58,23 +54,10 @@ static void espnow_receive_callback(
         .length = data_length
     };
 
-    memcpy(
-        frame.source,
-        info->src_addr,
-        ESP_NOW_ETH_ALEN
-    );
+    memcpy(frame.source, info->src_addr, ESP_NOW_ETH_ALEN);
+    memcpy(frame.data, data, data_length);
 
-    memcpy(
-        frame.data,
-        data,
-        data_length
-    );
-
-    (void)xQueueSend(
-        receive_queue,
-        &frame,
-        0
-    );
+    (void)xQueueSend(receive_queue, &frame, 0);
 }
 
 
@@ -88,12 +71,7 @@ static esp_err_t ensure_peer(
 
     esp_now_peer_info_t peer = {0};
 
-    memcpy(
-        peer.peer_addr,
-        peer_address,
-        ESP_NOW_ETH_ALEN
-    );
-
+    memcpy(peer.peer_addr, peer_address, ESP_NOW_ETH_ALEN);
     peer.ifidx = WIFI_IF_STA;
     peer.channel = ESPNOW_CHANNEL;
     peer.encrypt = false;
@@ -102,53 +80,91 @@ static esp_err_t ensure_peer(
 }
 
 
-static void espnow_echo_task(void *arg)
+bool espnow_transport_receive_request(
+    espnow_hid_request_t *request,
+    TickType_t wait_ticks
+)
 {
+    if (request == NULL || receive_queue == NULL) {
+        return false;
+    }
+
     espnow_frame_t frame;
 
-    while (1) {
-        if (
-            xQueueReceive(
-                receive_queue,
-                &frame,
-                portMAX_DELAY
-            ) != pdTRUE
-        ) {
-            continue;
-        }
-
-        esp_err_t err =
-            ensure_peer(frame.source);
-
-        if (err == ESP_OK) {
-            err = esp_now_send(
-                frame.source,
-                frame.data,
-                frame.length
-            );
-        }
-
-        if (err == ESP_OK) {
-            ESP_LOGI(
-                TAG,
-                "echoed %d opaque bytes to " MACSTR,
-                frame.length,
-                MAC2STR(frame.source)
-            );
-        }
-        else {
-            ESP_LOGE(
-                TAG,
-                "echo to " MACSTR " failed: %s",
-                MAC2STR(frame.source),
-                esp_err_to_name(err)
-            );
-        }
+    if (
+        xQueueReceive(
+            receive_queue,
+            &frame,
+            wait_ticks
+        ) != pdTRUE
+    ) {
+        return false;
     }
+
+    const uint8_t *payload = NULL;
+    size_t payload_length = 0;
+    uint32_t transaction_id = 0;
+
+    if (
+        !hid_tunnel_decode(
+            frame.data,
+            frame.length,
+            HID_TUNNEL_TYPE_REQUEST,
+            &transaction_id,
+            &payload,
+            &payload_length
+        )
+    ) {
+        ESP_LOGW(TAG, "discarding invalid request frame");
+        return false;
+    }
+
+    memcpy(request->source, frame.source, ESP_NOW_ETH_ALEN);
+    request->transaction_id = transaction_id;
+    request->payload_length = payload_length;
+    memcpy(request->payload, payload, payload_length);
+
+    return true;
 }
 
 
-esp_err_t espnow_echo_start(void)
+esp_err_t espnow_transport_send_response(
+    const uint8_t destination[ESP_NOW_ETH_ALEN],
+    uint32_t transaction_id,
+    const uint8_t *payload,
+    size_t payload_length
+)
+{
+    uint8_t frame[ESP_NOW_MAX_DATA_LEN];
+
+    size_t frame_length = hid_tunnel_encode(
+        frame,
+        sizeof(frame),
+        HID_TUNNEL_TYPE_RESPONSE,
+        transaction_id,
+        payload,
+        payload_length
+    );
+
+    if (frame_length == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ensure_peer(destination);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return esp_now_send(
+        destination,
+        frame,
+        frame_length
+    );
+}
+
+
+esp_err_t espnow_transport_start(void)
 {
     esp_err_t err = nvs_flash_init();
 
@@ -158,24 +174,17 @@ esp_err_t espnow_echo_start(void)
 
     err = esp_netif_init();
 
-    if (
-        err != ESP_OK &&
-        err != ESP_ERR_INVALID_STATE
-    ) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
     }
 
     err = esp_event_loop_create_default();
 
-    if (
-        err != ESP_OK &&
-        err != ESP_ERR_INVALID_STATE
-    ) {
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
     }
 
-    wifi_init_config_t wifi_config =
-        WIFI_INIT_CONFIG_DEFAULT();
+    wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
 
     err = esp_wifi_init(&wifi_config);
 
@@ -225,33 +234,15 @@ esp_err_t espnow_echo_start(void)
         return err;
     }
 
-    err = esp_now_register_recv_cb(
-        espnow_receive_callback
-    );
+    err = esp_now_register_recv_cb(espnow_receive_callback);
 
     if (err != ESP_OK) {
         return err;
     }
 
-    BaseType_t task_created = xTaskCreate(
-        espnow_echo_task,
-        "espnow_echo",
-        4096,
-        NULL,
-        5,
-        NULL
-    );
-
-    if (task_created != pdPASS) {
-        return ESP_ERR_NO_MEM;
-    }
-
     uint8_t station_mac[ESP_NOW_ETH_ALEN];
 
-    err = esp_wifi_get_mac(
-        WIFI_IF_STA,
-        station_mac
-    );
+    err = esp_wifi_get_mac(WIFI_IF_STA, station_mac);
 
     if (err != ESP_OK) {
         return err;
