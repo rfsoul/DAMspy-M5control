@@ -7,4 +7,6 @@ idf_component_register(
         esp_netif
         nvs_flash
         hid_tunnel_protocol
+        esp_driver_usb_serial_jtag
+        m5stack__m5gfx
 )

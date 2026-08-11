@@ -14,7 +14,10 @@
 #include "esp_netif.h"
 #include "esp_now.h"
 #include "esp_wifi.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 
 #include "M5GFX.h"
 
@@ -26,6 +29,12 @@
 #define TEST_INTERVAL_MS       3000
 #define HID_READ_LENGTH        64
 #define EMPTY_READ_TIMEOUT_MS  500
+#define BRIDGE_RESPONSE_MARGIN_MS 2000
+#define BRIDGE_OPERATION_TIMEOUT_MS 5000
+#define SERIAL_INNER_MAX       (HID_TUNNEL_HEADER_SIZE + HID_TUNNEL_MAX_BODY)
+#define SERIAL_RAW_MAX         (SERIAL_INNER_MAX + 2)
+#define SERIAL_ENCODED_MAX     (SERIAL_RAW_MAX + (SERIAL_RAW_MAX / 254) + 1)
+#define STICKS3_BUTTON_A_GPIO  GPIO_NUM_11
 
 
 typedef struct {
@@ -34,8 +43,6 @@ typedef struct {
     uint8_t data[ESP_NOW_MAX_DATA_LEN];
 } received_frame_t;
 
-
-static const char *TAG = "stick_echo_test";
 
 static const uint8_t broadcast_address[ESP_NOW_ETH_ALEN] = {
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
@@ -429,28 +436,503 @@ static esp_err_t initialise_espnow(void)
     return esp_now_add_peer(&peer);
 }
 
-
-extern "C" void app_main(void)
+static uint16_t crc16_ccitt_false(
+    const uint8_t *data,
+    size_t length
+)
 {
-    if (!display.init()) {
-        printf("Display initialization failed\n");
-        return;
+    uint16_t crc = 0xFFFF;
+
+    for (size_t i = 0; i < length; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x8000)
+                ? (uint16_t)((crc << 1) ^ 0x1021)
+                : (uint16_t)(crc << 1);
+        }
     }
 
-    display.setRotation(1);
-    show_starting();
+    return crc;
+}
 
-    esp_err_t err = initialise_espnow();
 
-    if (err != ESP_OK) {
-        ESP_LOGE(
-            TAG,
-            "ESP-NOW setup failed: %s",
-            esp_err_to_name(err)
+static size_t cobs_encode(
+    const uint8_t *input,
+    size_t input_length,
+    uint8_t *output,
+    size_t output_capacity
+)
+{
+    if (output_capacity == 0) {
+        return 0;
+    }
+
+    size_t read_index = 0;
+    size_t write_index = 1;
+    size_t code_index = 0;
+    uint8_t code = 1;
+
+    while (read_index < input_length) {
+        if (input[read_index] == 0) {
+            if (code_index >= output_capacity) {
+                return 0;
+            }
+
+            output[code_index] = code;
+            code_index = write_index++;
+            code = 1;
+            read_index++;
+        }
+        else {
+            if (write_index >= output_capacity) {
+                return 0;
+            }
+
+            output[write_index++] = input[read_index++];
+            code++;
+
+            if (code == 0xFF) {
+                if (code_index >= output_capacity) {
+                    return 0;
+                }
+
+                output[code_index] = code;
+                code_index = write_index++;
+                code = 1;
+            }
+        }
+    }
+
+    if (code_index >= output_capacity) {
+        return 0;
+    }
+
+    output[code_index] = code;
+    return write_index;
+}
+
+
+static size_t cobs_decode(
+    const uint8_t *input,
+    size_t input_length,
+    uint8_t *output,
+    size_t output_capacity
+)
+{
+    size_t read_index = 0;
+    size_t write_index = 0;
+
+    while (read_index < input_length) {
+        uint8_t code = input[read_index++];
+
+        if (code == 0) {
+            return 0;
+        }
+
+        size_t copy_length = code - 1;
+
+        if (
+            read_index + copy_length > input_length ||
+            write_index + copy_length > output_capacity
+        ) {
+            return 0;
+        }
+
+        memcpy(
+            &output[write_index],
+            &input[read_index],
+            copy_length
         );
-        show_result(0, 0, 1, -1, false, "ESPNOW SETUP");
+        read_index += copy_length;
+        write_index += copy_length;
+
+        if (code != 0xFF && read_index < input_length) {
+            if (write_index >= output_capacity) {
+                return 0;
+            }
+
+            output[write_index++] = 0;
+        }
+    }
+
+    return write_index;
+}
+
+
+static bool valid_serial_request(
+    const uint8_t *inner,
+    size_t inner_length,
+    hid_tunnel_message_t *message
+)
+{
+    if (!hid_tunnel_decode(inner, inner_length, message)) {
+        return false;
+    }
+
+    switch (message->type) {
+        case HID_TUNNEL_WRITE_REQUEST:
+            return
+                message->body_length > 0 &&
+                message->body_length <= HID_TUNNEL_MAX_HID_BYTES;
+
+        case HID_TUNNEL_READ_REQUEST:
+            return
+                message->body_length == HID_TUNNEL_READ_REQUEST_SIZE &&
+                hid_tunnel_get_u16(message->body) > 0 &&
+                hid_tunnel_get_u16(message->body) <=
+                    HID_TUNNEL_MAX_HID_BYTES &&
+                hid_tunnel_get_u32(&message->body[2]) > 0;
+
+        case HID_TUNNEL_STATUS_REQUEST:
+            return message->body_length == 0;
+
+        default:
+            return false;
+    }
+}
+
+
+static uint8_t expected_response_type(uint8_t request_type)
+{
+    return request_type + 1;
+}
+
+
+static uint32_t response_timeout_ms(
+    const hid_tunnel_message_t *request
+)
+{
+    if (request->type != HID_TUNNEL_READ_REQUEST) {
+        return BRIDGE_OPERATION_TIMEOUT_MS;
+    }
+
+    uint32_t requested = hid_tunnel_get_u32(&request->body[2]);
+
+    if (requested > UINT32_MAX - BRIDGE_RESPONSE_MARGIN_MS) {
+        return UINT32_MAX;
+    }
+
+    return requested + BRIDGE_RESPONSE_MARGIN_MS;
+}
+
+
+static bool serial_write_all(
+    const uint8_t *data,
+    size_t length
+)
+{
+    size_t written = 0;
+
+    while (written < length) {
+        int result = usb_serial_jtag_write_bytes(
+            &data[written],
+            length - written,
+            pdMS_TO_TICKS(1000)
+        );
+
+        if (result <= 0) {
+            return false;
+        }
+
+        written += result;
+    }
+
+    return true;
+}
+
+
+static bool serial_send_inner(
+    const uint8_t *inner,
+    size_t inner_length
+)
+{
+    uint8_t raw[SERIAL_RAW_MAX];
+    uint8_t encoded[SERIAL_ENCODED_MAX + 1];
+
+    if (inner_length > SERIAL_INNER_MAX) {
+        return false;
+    }
+
+    memcpy(raw, inner, inner_length);
+    hid_tunnel_put_u16(
+        &raw[inner_length],
+        crc16_ccitt_false(inner, inner_length)
+    );
+
+    size_t encoded_length = cobs_encode(
+        raw,
+        inner_length + 2,
+        encoded,
+        SERIAL_ENCODED_MAX
+    );
+
+    if (encoded_length == 0) {
+        return false;
+    }
+
+    encoded[encoded_length++] = 0;
+    return serial_write_all(encoded, encoded_length);
+}
+
+
+static bool serial_read_inner(
+    uint8_t *inner,
+    size_t *inner_length
+)
+{
+    static uint8_t encoded[SERIAL_ENCODED_MAX];
+    static size_t encoded_length = 0;
+    static bool overflow = false;
+    uint8_t byte;
+
+    while (1) {
+        if (
+            usb_serial_jtag_read_bytes(
+                &byte,
+                1,
+                pdMS_TO_TICKS(100)
+            ) != 1
+        ) {
+            continue;
+        }
+
+        if (byte != 0) {
+            if (!overflow && encoded_length < sizeof(encoded)) {
+                encoded[encoded_length++] = byte;
+            }
+            else {
+                overflow = true;
+            }
+
+            continue;
+        }
+
+        if (overflow || encoded_length == 0) {
+            overflow = false;
+            encoded_length = 0;
+            return false;
+        }
+
+        uint8_t raw[SERIAL_RAW_MAX];
+        size_t raw_length = cobs_decode(
+            encoded,
+            encoded_length,
+            raw,
+            sizeof(raw)
+        );
+        encoded_length = 0;
+
+        if (raw_length < HID_TUNNEL_HEADER_SIZE + 2) {
+            return false;
+        }
+
+        size_t candidate_length = raw_length - 2;
+        uint16_t supplied_crc = hid_tunnel_get_u16(
+            &raw[candidate_length]
+        );
+
+        if (
+            supplied_crc !=
+                crc16_ccitt_false(raw, candidate_length)
+        ) {
+            return false;
+        }
+
+        memcpy(inner, raw, candidate_length);
+        *inner_length = candidate_length;
+        return true;
+    }
+}
+
+
+static void show_bridge(
+    uint32_t forwarded,
+    uint32_t returned,
+    uint32_t rejected,
+    uint8_t type,
+    uint32_t request_id,
+    const char *state,
+    bool error
+)
+{
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setTextSize(2);
+    display.setCursor(8, 6);
+    display.println("DAMspy BRIDGE");
+    display.printf(
+        "TX:%lu RX:%lu BAD:%lu\n",
+        (unsigned long)forwarded,
+        (unsigned long)returned,
+        (unsigned long)rejected
+    );
+    display.printf(
+        "Type:%02X ID:%lu\n",
+        type,
+        (unsigned long)request_id
+    );
+    display.setTextColor(error ? TFT_RED : TFT_GREEN, TFT_BLACK);
+    display.println(state);
+}
+
+
+static void run_bridge(void)
+{
+    usb_serial_jtag_driver_config_t serial_config =
+        USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+
+    if (
+        usb_serial_jtag_driver_install(&serial_config) != ESP_OK
+    ) {
+        show_bridge(0, 0, 1, 0, 0, "SERIAL ERROR", true);
         return;
     }
+
+    uint32_t forwarded = 0;
+    uint32_t returned = 0;
+    uint32_t rejected = 0;
+    show_bridge(0, 0, 0, 0, 0, "READY", false);
+
+    while (1) {
+        uint8_t inner[SERIAL_INNER_MAX];
+        size_t inner_length = 0;
+
+        if (!serial_read_inner(inner, &inner_length)) {
+            rejected++;
+            show_bridge(
+                forwarded, returned, rejected,
+                0, 0, "BAD SERIAL FRAME", true
+            );
+            continue;
+        }
+
+        hid_tunnel_message_t request = {};
+
+        if (
+            !valid_serial_request(
+                inner,
+                inner_length,
+                &request
+            )
+        ) {
+            rejected++;
+            show_bridge(
+                forwarded, returned, rejected,
+                0, 0, "BAD REQUEST", true
+            );
+            continue;
+        }
+
+        xQueueReset(receive_queue);
+        esp_err_t err = esp_now_send(
+            broadcast_address,
+            inner,
+            inner_length
+        );
+
+        if (err != ESP_OK) {
+            rejected++;
+            show_bridge(
+                forwarded, returned, rejected,
+                request.type, request.request_id,
+                "ESP-NOW SEND FAIL", true
+            );
+            continue;
+        }
+
+        forwarded++;
+        show_bridge(
+            forwarded, returned, rejected,
+            request.type, request.request_id,
+            "WAITING", false
+        );
+
+        int64_t deadline_us =
+            esp_timer_get_time() +
+            ((int64_t)response_timeout_ms(&request) * 1000);
+        bool matched = false;
+
+        while (esp_timer_get_time() < deadline_us) {
+            int64_t remaining_us =
+                deadline_us - esp_timer_get_time();
+            TickType_t wait_ticks = pdMS_TO_TICKS(
+                (remaining_us + 999) / 1000
+            );
+
+            if (wait_ticks == 0) {
+                wait_ticks = 1;
+            }
+
+            received_frame_t received = {};
+
+            if (
+                xQueueReceive(
+                    receive_queue,
+                    &received,
+                    wait_ticks
+                ) != pdTRUE
+            ) {
+                break;
+            }
+
+            hid_tunnel_message_t response = {};
+
+            if (
+                !hid_tunnel_decode(
+                    received.data,
+                    received.length,
+                    &response
+                ) ||
+                response.type !=
+                    expected_response_type(request.type) ||
+                response.request_id != request.request_id
+            ) {
+                continue;
+            }
+
+            matched = true;
+
+            if (
+                serial_send_inner(
+                    received.data,
+                    received.length
+                )
+            ) {
+                returned++;
+                show_bridge(
+                    forwarded, returned, rejected,
+                    request.type, request.request_id,
+                    "RESPONSE SENT", false
+                );
+            }
+            else {
+                rejected++;
+                show_bridge(
+                    forwarded, returned, rejected,
+                    request.type, request.request_id,
+                    "SERIAL SEND FAIL", true
+                );
+            }
+
+            break;
+        }
+
+        if (!matched) {
+            rejected++;
+            show_bridge(
+                forwarded, returned, rejected,
+                request.type, request.request_id,
+                "LINK TIMEOUT", true
+            );
+        }
+    }
+}
+
+
+static void run_diagnostic(void)
+{
+    show_starting();
 
     uint8_t station_mac[ESP_NOW_ETH_ALEN];
 
@@ -622,5 +1104,53 @@ extern "C" void app_main(void)
         }
 
         vTaskDelay(pdMS_TO_TICKS(TEST_INTERVAL_MS));
+    }
+}
+
+
+extern "C" void app_main(void)
+{
+    if (!display.init()) {
+        return;
+    }
+
+    display.setRotation(1);
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setTextSize(2);
+    display.setCursor(8, 12);
+    display.println("DAMspy");
+    display.println("Hold BtnA:");
+    display.println("diagnostic");
+
+    gpio_config_t button_config = {};
+    button_config.pin_bit_mask =
+        1ULL << STICKS3_BUTTON_A_GPIO;
+    button_config.mode = GPIO_MODE_INPUT;
+    button_config.pull_up_en = GPIO_PULLUP_ENABLE;
+    button_config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    button_config.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&button_config);
+
+    bool diagnostic_mode = false;
+
+    for (int i = 0; i < 40; i++) {
+        diagnostic_mode |=
+            gpio_get_level(STICKS3_BUTTON_A_GPIO) == 0;
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
+    esp_err_t err = initialise_espnow();
+
+    if (err != ESP_OK) {
+        show_result(0, 0, 1, -1, false, "ESPNOW SETUP");
+        return;
+    }
+
+    if (diagnostic_mode) {
+        run_diagnostic();
+    }
+    else {
+        run_bridge();
     }
 }
