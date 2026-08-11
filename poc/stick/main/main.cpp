@@ -25,6 +25,7 @@
 #define RESPONSE_TIMEOUT_MS    5000
 #define TEST_INTERVAL_MS       3000
 #define HID_READ_LENGTH        64
+#define EMPTY_READ_TIMEOUT_MS  500
 
 
 typedef struct {
@@ -99,7 +100,7 @@ static void show_result(
     );
     display.printf("RESULT: %s\n", passed ? "PASS" : "FAIL");
 
-    if (!passed) {
+    if (reason[0] != '\0') {
         display.println(reason);
     }
 }
@@ -164,6 +165,132 @@ static esp_err_t exchange_operation(
     }
 
     return ESP_OK;
+}
+
+
+static bool battery_write(
+    uint32_t request_id,
+    const char **reason
+)
+{
+    received_frame_t received;
+    esp_err_t err = exchange_operation(
+        HID_TUNNEL_WRITE_REQUEST,
+        request_id,
+        test_frame,
+        sizeof(test_frame),
+        &received
+    );
+
+    if (err != ESP_OK) {
+        *reason = err == ESP_ERR_TIMEOUT
+            ? "WRITE TIMEOUT"
+            : "WRITE ERROR";
+        return false;
+    }
+
+    hid_tunnel_message_t response = {};
+
+    if (
+        !hid_tunnel_decode(
+            received.data,
+            received.length,
+            &response
+        ) ||
+        response.type != HID_TUNNEL_WRITE_RESPONSE ||
+        response.request_id != request_id ||
+        response.body_length != HID_TUNNEL_WRITE_RESPONSE_SIZE ||
+        response.body[0] != HID_TUNNEL_RESULT_OK ||
+        hid_tunnel_get_u16(&response.body[1]) != sizeof(test_frame)
+    ) {
+        *reason = "WRITE ERROR";
+        return false;
+    }
+
+    return true;
+}
+
+
+static bool hid_read(
+    uint32_t request_id,
+    uint32_t timeout_ms,
+    uint8_t *result,
+    uint8_t *data,
+    size_t *data_length,
+    const char **reason
+)
+{
+    uint8_t read_request[HID_TUNNEL_READ_REQUEST_SIZE];
+    hid_tunnel_put_u16(read_request, HID_READ_LENGTH);
+    hid_tunnel_put_u32(&read_request[2], timeout_ms);
+
+    received_frame_t received;
+    esp_err_t err = exchange_operation(
+        HID_TUNNEL_READ_REQUEST,
+        request_id,
+        read_request,
+        sizeof(read_request),
+        &received
+    );
+
+    if (err != ESP_OK) {
+        *reason = err == ESP_ERR_TIMEOUT
+            ? "READ LINK TIMEOUT"
+            : "READ ERROR";
+        return false;
+    }
+
+    hid_tunnel_message_t response = {};
+
+    if (
+        !hid_tunnel_decode(
+            received.data,
+            received.length,
+            &response
+        ) ||
+        response.type != HID_TUNNEL_READ_RESPONSE ||
+        response.request_id != request_id ||
+        response.body_length < HID_TUNNEL_READ_RESPONSE_OVERHEAD
+    ) {
+        *reason = "READ ERROR";
+        return false;
+    }
+
+    *result = response.body[0];
+    *data_length = hid_tunnel_get_u16(&response.body[1]);
+
+    if (
+        response.body_length !=
+            HID_TUNNEL_READ_RESPONSE_OVERHEAD +
+            *data_length ||
+        *data_length > HID_TUNNEL_MAX_HID_BYTES
+    ) {
+        *reason = "READ LENGTH";
+        return false;
+    }
+
+    if (*data_length > 0) {
+        memcpy(
+            data,
+            &response.body[HID_TUNNEL_READ_RESPONSE_OVERHEAD],
+            *data_length
+        );
+    }
+
+    return true;
+}
+
+
+static bool valid_battery_response(
+    const uint8_t *data,
+    size_t length
+)
+{
+    return
+        length >= 3 &&
+        data[0] == 0x02 &&
+        data[1] == 0x61 &&
+        data[2] == 0x41;
 }
 
 
@@ -353,117 +480,136 @@ extern "C" void app_main(void)
         xQueueReset(receive_queue);
 
         print_hex("TX HID", test_frame, sizeof(test_frame));
-        uint32_t write_id = (test_count * 2) - 1;
-        uint32_t read_id = write_id + 1;
-        received_frame_t received;
+        uint32_t first_id = ((test_count - 1) * 5) + 1;
         const char *reason = "";
+        const char *pass_detail = "";
         int response_length = -1;
+        uint8_t read_result = HID_TUNNEL_RESULT_USB_ERROR;
+        uint8_t read_data[HID_TUNNEL_MAX_HID_BYTES];
+        size_t read_length = 0;
+        bool empty_read_timed_out = false;
 
-        printf("WRITE request: %lu\n", (unsigned long)write_id);
-        err = exchange_operation(
-            HID_TUNNEL_WRITE_REQUEST,
-            write_id,
-            test_frame,
-            sizeof(test_frame),
-            &received
+        printf(
+            "Battery WRITE 1: %lu\n",
+            (unsigned long)first_id
         );
 
-        hid_tunnel_message_t response = {};
-        bool write_ok =
-            err == ESP_OK &&
-            hid_tunnel_decode(
-                received.data,
-                received.length,
-                &response
-            ) &&
-            response.type == HID_TUNNEL_WRITE_RESPONSE &&
-            response.request_id == write_id &&
-            response.body_length == HID_TUNNEL_WRITE_RESPONSE_SIZE &&
-            response.body[0] == HID_TUNNEL_RESULT_OK &&
-            hid_tunnel_get_u16(&response.body[1]) == sizeof(test_frame);
+        bool test_ok = battery_write(first_id, &reason);
 
-        if (!write_ok) {
-            reason = err == ESP_ERR_TIMEOUT
-                ? "WRITE TIMEOUT"
-                : "WRITE ERROR";
-        }
-        else {
+        if (test_ok) {
             printf(
-                "WRITE OK: %u bytes\n",
-                hid_tunnel_get_u16(&response.body[1])
+                "Battery READ 1: %lu\n",
+                (unsigned long)(first_id + 1)
             );
 
-            uint8_t read_request[HID_TUNNEL_READ_REQUEST_SIZE];
-            hid_tunnel_put_u16(read_request, HID_READ_LENGTH);
-            hid_tunnel_put_u32(&read_request[2], RESPONSE_TIMEOUT_MS);
-
-            printf("READ request: %lu\n", (unsigned long)read_id);
-            err = exchange_operation(
-                HID_TUNNEL_READ_REQUEST,
-                read_id,
-                read_request,
-                sizeof(read_request),
-                &received
+            test_ok = hid_read(
+                first_id + 1,
+                RESPONSE_TIMEOUT_MS,
+                &read_result,
+                read_data,
+                &read_length,
+                &reason
             );
 
-            response = {};
-            bool read_frame_ok =
-                err == ESP_OK &&
-                hid_tunnel_decode(
-                    received.data,
-                    received.length,
-                    &response
-                ) &&
-                response.type == HID_TUNNEL_READ_RESPONSE &&
-                response.request_id == read_id &&
-                response.body_length >= HID_TUNNEL_READ_RESPONSE_OVERHEAD;
-
-            if (!read_frame_ok) {
-                reason = err == ESP_ERR_TIMEOUT
-                    ? "READ TIMEOUT"
-                    : "READ ERROR";
-            }
-            else if (response.body[0] != HID_TUNNEL_RESULT_OK) {
-                reason = response.body[0] == HID_TUNNEL_RESULT_TIMEOUT
-                    ? "READ TIMEOUT"
-                    : "READ USB ERROR";
-            }
-            else {
-                response_length = hid_tunnel_get_u16(&response.body[1]);
-
-                if (
-                    response.body_length !=
-                        HID_TUNNEL_READ_RESPONSE_OVERHEAD +
-                        response_length
-                ) {
-                    reason = "READ LENGTH";
-                    response_length = -1;
-                }
-                else {
-                    print_hex(
-                        "RX HID",
-                        &response.body[HID_TUNNEL_READ_RESPONSE_OVERHEAD],
-                        response_length
-                    );
-
-                    if (
-                        response_length < 3 ||
-                        response.body[3] != 0x02 ||
-                        response.body[4] != 0x61 ||
-                        response.body[5] != 0x41
-                    ) {
-                        reason = "BAD PREFIX";
-                    }
-                }
+            if (
+                test_ok &&
+                (
+                    read_result != HID_TUNNEL_RESULT_OK ||
+                    !valid_battery_response(read_data, read_length)
+                )
+            ) {
+                reason = read_result == HID_TUNNEL_RESULT_TIMEOUT
+                    ? "BATTERY TIMEOUT"
+                    : "BAD PREFIX 1";
+                test_ok = false;
             }
         }
 
-        if (reason[0] == '\0') {
+        if (test_ok) {
+            print_hex("Battery RX 1", read_data, read_length);
+            read_length = 0;
+
+            printf(
+                "Empty READ: %lu (%d ms)\n",
+                (unsigned long)(first_id + 2),
+                EMPTY_READ_TIMEOUT_MS
+            );
+
+            test_ok = hid_read(
+                first_id + 2,
+                EMPTY_READ_TIMEOUT_MS,
+                &read_result,
+                read_data,
+                &read_length,
+                &reason
+            );
+
+            if (test_ok && read_result == HID_TUNNEL_RESULT_TIMEOUT) {
+                empty_read_timed_out = true;
+                printf("Empty READ returned TIMEOUT\n");
+            }
+            else if (test_ok && read_result == HID_TUNNEL_RESULT_OK) {
+                printf("Empty READ returned real data\n");
+                print_hex("Empty READ RX", read_data, read_length);
+            }
+            else if (test_ok) {
+                reason = "EMPTY READ ERROR";
+                test_ok = false;
+            }
+        }
+
+        if (test_ok) {
+            printf(
+                "Battery WRITE 2: %lu\n",
+                (unsigned long)(first_id + 3)
+            );
+            test_ok = battery_write(first_id + 3, &reason);
+        }
+
+        if (test_ok) {
+            read_length = 0;
+            printf(
+                "Battery READ 2: %lu\n",
+                (unsigned long)(first_id + 4)
+            );
+
+            test_ok = hid_read(
+                first_id + 4,
+                RESPONSE_TIMEOUT_MS,
+                &read_result,
+                read_data,
+                &read_length,
+                &reason
+            );
+
+            if (
+                test_ok &&
+                (
+                    read_result != HID_TUNNEL_RESULT_OK ||
+                    !valid_battery_response(read_data, read_length)
+                )
+            ) {
+                reason = read_result == HID_TUNNEL_RESULT_TIMEOUT
+                    ? "POST READ TIMEOUT"
+                    : "BAD PREFIX 2";
+                test_ok = false;
+            }
+        }
+
+        if (test_ok) {
+            print_hex("Battery RX 2", read_data, read_length);
+            response_length = read_length;
+            pass_detail = empty_read_timed_out
+                ? "TIMEOUT RECOVERED"
+                : "EMPTY READ HAD DATA";
+        }
+
+        if (test_ok) {
             pass_count++;
             printf("RESULT: PASS\n");
             show_result(
                 test_count, pass_count, fail_count,
-                response_length, true, ""
+                response_length, true, pass_detail
             );
         }
         else {

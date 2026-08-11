@@ -11,6 +11,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
+#include "esp_timer.h"
 
 #include "driver/i2c_master.h"
 
@@ -125,6 +126,9 @@ static bool battery_transaction_active = false;
 static size_t active_write_length = 0;
 static uint16_t active_read_length = 0;
 static uint32_t active_read_timeout_ms = 0;
+static int64_t active_read_deadline_us = 0;
+static bool read_timeout_cancel_pending = false;
+static bool read_endpoint_needs_clear = false;
 static uint32_t active_request_id = 0;
 static uint8_t active_requester[ESP_NOW_ETH_ALEN] = {0};
 static bool active_tunnel_transaction = false;
@@ -1127,11 +1131,23 @@ static void battery_input_callback(
     usb_transfer_t *transfer
 )
 {
-    uint8_t result = transfer->status == USB_TRANSFER_STATUS_COMPLETED
-        ? HID_TUNNEL_RESULT_OK
-        : (transfer->status == USB_TRANSFER_STATUS_TIMED_OUT
-            ? HID_TUNNEL_RESULT_TIMEOUT
-            : HID_TUNNEL_RESULT_USB_ERROR);
+    uint8_t result;
+
+    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        result = HID_TUNNEL_RESULT_OK;
+    }
+    else if (
+        transfer->status == USB_TRANSFER_STATUS_TIMED_OUT ||
+        (
+            transfer->status == USB_TRANSFER_STATUS_CANCELED &&
+            read_timeout_cancel_pending
+        )
+    ) {
+        result = HID_TUNNEL_RESULT_TIMEOUT;
+    }
+    else {
+        result = HID_TUNNEL_RESULT_USB_ERROR;
+    }
 
     int length = result == HID_TUNNEL_RESULT_OK
         ? transfer->actual_num_bytes
@@ -1148,7 +1164,12 @@ static void battery_input_callback(
         length
     );
 
-    battery_transaction_active = false;
+    active_read_deadline_us = 0;
+
+    if (!read_endpoint_needs_clear) {
+        battery_transaction_active = false;
+        read_timeout_cancel_pending = false;
+    }
 }
 
 
@@ -1316,6 +1337,11 @@ static esp_err_t hid_interrupt_read(
 
     active_read_length = requested_length;
     active_read_timeout_ms = timeout_ms;
+    active_read_deadline_us =
+        esp_timer_get_time() +
+        ((int64_t)timeout_ms * 1000);
+    read_timeout_cancel_pending = false;
+    read_endpoint_needs_clear = false;
     active_request_id = request_id;
     active_tunnel_transaction = true;
     memcpy(active_requester, requester, ESP_NOW_ETH_ALEN);
@@ -1325,6 +1351,7 @@ static esp_err_t hid_interrupt_read(
 
     if (err != ESP_OK) {
         battery_transaction_active = false;
+        active_read_deadline_us = 0;
     }
 
     return err;
@@ -1983,10 +2010,15 @@ void app_main(void)
 
     while (1) {
 
+        TickType_t event_wait =
+            active_read_deadline_us > 0
+            ? pdMS_TO_TICKS(10)
+            : pdMS_TO_TICKS(100);
+
         err =
             usb_host_client_handle_events(
                 client_hdl,
-                pdMS_TO_TICKS(100)
+                event_wait
             );
 
 
@@ -2003,6 +2035,46 @@ void app_main(void)
         }
 
 
+        if (
+            battery_transaction_active &&
+            active_read_deadline_us > 0 &&
+            !read_timeout_cancel_pending &&
+            esp_timer_get_time() >= active_read_deadline_us
+        ) {
+            read_timeout_cancel_pending = true;
+
+            esp_err_t halt_err = usb_host_endpoint_halt(
+                device_hdl,
+                hid_in_endpoint
+            );
+
+            if (halt_err == ESP_OK) {
+                read_endpoint_needs_clear = true;
+
+                esp_err_t flush_err = usb_host_endpoint_flush(
+                    device_hdl,
+                    hid_in_endpoint
+                );
+
+                if (flush_err != ESP_OK) {
+                    ESP_LOGW(
+                        TAG,
+                        "READ timeout flush: %s",
+                        esp_err_to_name(flush_err)
+                    );
+                }
+            }
+            else {
+                read_timeout_cancel_pending = false;
+                ESP_LOGW(
+                    TAG,
+                    "READ timeout halt: %s",
+                    esp_err_to_name(halt_err)
+                );
+            }
+        }
+
+
         hid_response_t hid_response;
 
         while (
@@ -2012,6 +2084,32 @@ void app_main(void)
                 0
             ) == pdTRUE
         ) {
+            if (
+                hid_response.operation == HID_TUNNEL_READ_RESPONSE &&
+                read_endpoint_needs_clear
+            ) {
+                esp_err_t clear_err = usb_host_endpoint_clear(
+                    device_hdl,
+                    hid_in_endpoint
+                );
+
+                if (clear_err != ESP_OK) {
+                    hid_response.result = HID_TUNNEL_RESULT_USB_ERROR;
+                    hid_response.length = 0;
+                    hid_ready = false;
+
+                    ESP_LOGE(
+                        TAG,
+                        "READ timeout clear: %s",
+                        esp_err_to_name(clear_err)
+                    );
+                }
+
+                read_endpoint_needs_clear = false;
+                read_timeout_cancel_pending = false;
+                battery_transaction_active = false;
+            }
+
             if (hid_response.tunnel_transaction) {
                 uint8_t body[HID_TUNNEL_MAX_BODY];
                 size_t body_length = 0;
@@ -2212,6 +2310,9 @@ void app_main(void)
 
             device_gone = false;
             battery_transaction_active = false;
+            active_read_deadline_us = 0;
+            read_timeout_cancel_pending = false;
+            read_endpoint_needs_clear = false;
             xQueueReset(hid_response_queue);
             usb_connected = false;
             hid_ready = false;
