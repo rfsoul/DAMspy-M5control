@@ -104,6 +104,9 @@ static const uint8_t wireless_pro_battery_request[BATTERY_REQUEST_LENGTH] = {
 static const char *TAG = "DAMspy";
 
 static lv_obj_t *status_label = NULL;
+static lv_obj_t *telemetry_label = NULL;
+static lv_obj_t *grove_host_button = NULL;
+static volatile bool grove_host_selected = false;
 
 static i2c_master_dev_handle_t axp_dev = NULL;
 static i2c_master_dev_handle_t aw_dev = NULL;
@@ -216,6 +219,48 @@ static void screen_printf(const char *format, ...)
     }
 
     lv_label_set_text(status_label, buffer);
+
+    bsp_display_unlock();
+}
+
+
+static void grove_host_button_cb(lv_event_t *event)
+{
+    (void)event;
+    grove_host_selected = true;
+}
+
+
+static void show_grove_host_button(void)
+{
+    bsp_display_lock(0);
+
+    grove_host_button = lv_button_create(lv_screen_active());
+    lv_obj_set_size(grove_host_button, 190, 50);
+    lv_obj_align(grove_host_button, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_add_event_cb(
+        grove_host_button,
+        grove_host_button_cb,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_t *label = lv_label_create(grove_host_button);
+    lv_label_set_text(label, "START GROVE HOST");
+    lv_obj_center(label);
+
+    bsp_display_unlock();
+}
+
+
+static void remove_grove_host_button(void)
+{
+    bsp_display_lock(0);
+
+    if (grove_host_button != NULL) {
+        lv_obj_delete(grove_host_button);
+        grove_host_button = NULL;
+    }
 
     bsp_display_unlock();
 }
@@ -527,6 +572,89 @@ static esp_err_t read_core_power(
 }
 
 
+static void telemetry_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        core_power_info_t power;
+        int battery_percent = -1;
+
+        if (read_core_power(&power) == ESP_OK) {
+            battery_percent = power.battery_percent;
+        }
+
+        char telemetry[96];
+        int8_t rssi;
+        uint32_t age_seconds;
+
+        if (
+            espnow_transport_get_last_rx(
+                &rssi,
+                &age_seconds
+            )
+        ) {
+            snprintf(
+                telemetry,
+                sizeof(telemetry),
+                "Core: %d%%   RX RSSI: %d dBm (%lu)",
+                battery_percent,
+                rssi,
+                (unsigned long)age_seconds
+            );
+        }
+        else {
+            snprintf(
+                telemetry,
+                sizeof(telemetry),
+                "Core: %d%%   RX RSSI: -- (none)",
+                battery_percent
+            );
+        }
+
+        bsp_display_lock(0);
+
+        if (telemetry_label == NULL) {
+            telemetry_label =
+                lv_label_create(lv_screen_active());
+            lv_obj_set_width(telemetry_label, 310);
+            lv_obj_set_style_text_font(
+                telemetry_label,
+                &lv_font_montserrat_14,
+                0
+            );
+            lv_obj_set_style_text_color(
+                telemetry_label,
+                lv_color_black(),
+                0
+            );
+            lv_obj_set_style_bg_color(
+                telemetry_label,
+                lv_color_white(),
+                0
+            );
+            lv_obj_set_style_bg_opa(
+                telemetry_label,
+                LV_OPA_COVER,
+                0
+            );
+            lv_obj_align(
+                telemetry_label,
+                LV_ALIGN_BOTTOM_LEFT,
+                5,
+                -4
+            );
+        }
+
+        lv_label_set_text(telemetry_label, telemetry);
+        lv_obj_move_foreground(telemetry_label);
+        bsp_display_unlock();
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
 /* ============================================================
  * CoreS3 USB power
  * ============================================================ */
@@ -696,7 +824,7 @@ static void cores3_usb_power(bool enable)
     if (enable) {
 
         /*
-         * Proven sequence:
+         * Proven USB host power-up sequence:
          *
          * BOOST
          * wait
@@ -781,6 +909,46 @@ static void cores3_usb_power(bool enable)
             fatal_error("BOOST OFF", err);
         }
     }
+}
+
+
+static void cores3_grove_host_power(void)
+{
+    /*
+     * External 5 V enters on BUS_OUT. Keep the internal boost and
+     * BUS_OUT switch disabled, then connect that rail to USB VBUS.
+     */
+    cores3_usb_power(false);
+
+    uint8_t out0 = 0;
+    uint8_t out1 = 0;
+    esp_err_t err = i2c_read_pair(
+        aw_dev,
+        AW_REG_OUTPUT_P0,
+        &out0,
+        &out1
+    );
+
+    if (err != ESP_OK) {
+        fatal_error("read Grove host power", err);
+    }
+
+    out0 &= ~BUS_OUT_EN_MASK;
+    out0 |= USB_OTG_EN_MASK;
+    out1 &= ~BOOST_EN_MASK;
+
+    err = i2c_write_pair(
+        aw_dev,
+        AW_REG_OUTPUT_P0,
+        out0,
+        out1
+    );
+
+    if (err != ESP_OK) {
+        fatal_error("Grove host power", err);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(300));
 }
 
 
@@ -1817,76 +1985,60 @@ void app_main(void)
 
 
     /* ========================================================
-     * CHARGE MODE
+     * POWER MODE SELECTION
      * ======================================================== */
+
+    bool grove_host_mode = false;
 
     if (power.vbus_present) {
 
         cores3_usb_power(false);
+        show_grove_host_button();
 
+        while (!grove_host_selected) {
 
-        while (1) {
-
-            err =
-                read_core_power(
-                    &power
-                );
-
+            err = read_core_power(&power);
 
             if (err != ESP_OK) {
-
                 screen_printf(
                     "DAMspy M5 Control\n\n"
-                    "CHARGE MODE\n\n"
+                    "POWER MODE\n\n"
                     "Power read error"
                 );
-
-                vTaskDelay(
-                    pdMS_TO_TICKS(2000)
-                );
-
-                continue;
             }
-
-
-            if (power.vbus_present) {
-
+            else if (power.vbus_present) {
                 screen_printf(
                     "DAMspy M5 Control\n\n"
-                    "CHARGE MODE\n\n"
-                    "External VBUS: YES\n\n"
-                    "Core battery: %d%%\n"
-                    "Battery: %.3f V\n\n"
+                    "EXTERNAL POWER\n\n"
+                    "Core: %d%% %.3fV\n"
                     "%s\n\n"
-                    "Unplug + RESET\n"
-                    "for HOST mode",
+                    "PC USB: leave in charge mode\n"
+                    "Grove: tap button for host",
                     power.battery_percent,
                     power.battery_voltage,
-                    power.charging
-                        ? "CHARGING"
-                        : "Powered / standby"
+                    power.charging ? "CHARGING" : "Powered / standby"
                 );
             }
             else {
-
                 screen_printf(
                     "DAMspy M5 Control\n\n"
-                    "CHARGE MODE\n\n"
-                    "External VBUS removed\n\n"
-                    "Core battery: %d%%\n"
-                    "Battery: %.3f V\n\n"
-                    "Press RESET\n"
-                    "for HOST mode",
-                    power.battery_percent,
-                    power.battery_voltage
+                    "External power removed\n\n"
+                    "Reset for battery host mode"
                 );
             }
 
-
-            vTaskDelay(
-                pdMS_TO_TICKS(2000)
-            );
+            vTaskDelay(pdMS_TO_TICKS(250));
         }
+
+        err = read_core_power(&power);
+        if (err != ESP_OK || !power.vbus_present) {
+            grove_host_selected = false;
+            remove_grove_host_button();
+            fatal_error("Grove power removed", ESP_ERR_INVALID_STATE);
+        }
+
+        remove_grove_host_button();
+        grove_host_mode = true;
     }
 
 
@@ -1894,37 +2046,53 @@ void app_main(void)
      * HOST MODE
      * ======================================================== */
 
-    for (int i = 5; i > 0; i--) {
+    if (grove_host_mode) {
+        screen_printf(
+            "DAMspy M5 Control\n\n"
+            "GROVE HOST MODE\n\n"
+            "External 5V: YES\n"
+            "Core: %d%% %.3fV\n\n"
+            "Enabling DUT VBUS...",
+            power.battery_percent,
+            power.battery_voltage
+        );
+
+        cores3_grove_host_power();
+    }
+    else {
+        /*
+         * Enter a known-safe transition state before the countdown:
+         * neither Grove/bus output nor USB-C host VBUS is driven.
+         */
+        cores3_usb_power(false);
+
+        for (int i = 5; i > 0; i--) {
+            screen_printf(
+                "DAMspy M5 Control\n\n"
+                "BATTERY HOST MODE\n\n"
+                "Core: %d%% %.3fV\n\n"
+                "Disconnect PC USB NOW\n"
+                "Keep Grove disconnected\n\n"
+                "USB host in %d...",
+                power.battery_percent,
+                power.battery_voltage,
+                i
+            );
+
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
 
         screen_printf(
             "DAMspy M5 Control\n\n"
-            "HOST MODE\n\n"
-            "Core battery: %d%%\n"
-            "Battery: %.3f V\n\n"
-            "USB host in %d...",
+            "BATTERY HOST MODE\n\n"
+            "Core: %d%% %.3fV\n\n"
+            "Enabling DUT VBUS...",
             power.battery_percent,
-            power.battery_voltage,
-            i
+            power.battery_voltage
         );
 
-
-        vTaskDelay(
-            pdMS_TO_TICKS(1000)
-        );
+        cores3_usb_power(true);
     }
-
-
-    screen_printf(
-        "DAMspy M5 Control\n\n"
-        "HOST MODE\n\n"
-        "Core: %d%% %.3fV\n\n"
-        "Enabling DUT VBUS...",
-        power.battery_percent,
-        power.battery_voltage
-    );
-
-
-    cores3_usb_power(true);
 
 
     /* --------------------------------------------------------
@@ -1947,6 +2115,19 @@ void app_main(void)
             "ESP-NOW transport",
             err
         );
+    }
+
+    if (
+        xTaskCreate(
+            telemetry_task,
+            "telemetry",
+            3072,
+            NULL,
+            4,
+            NULL
+        ) != pdPASS
+    ) {
+        fatal_error("telemetry task", ESP_ERR_NO_MEM);
     }
 
 
@@ -2032,9 +2213,11 @@ void app_main(void)
         "DAMspy M5 Control\n\n"
         "USB HOST READY\n\n"
         "Core: %d%% %.3fV\n\n"
-        "Waiting for RODE...",
+        "Waiting for RODE...\n\n"
+        "%s",
         power.battery_percent,
-        power.battery_voltage
+        power.battery_voltage,
+        grove_host_mode ? "Powered from Grove" : "Keep Grove disconnected"
     );
 
 
@@ -2390,9 +2573,11 @@ void app_main(void)
                 "USB HOST READY\n\n"
                 "Device removed\n\n"
                 "Core: %d%% %.3fV\n\n"
-                "Waiting for RODE...",
+                "Waiting for RODE...\n\n"
+                "%s",
                 power.battery_percent,
-                power.battery_voltage
+                power.battery_voltage,
+                grove_host_mode ? "Powered from Grove" : "Keep Grove disconnected"
             );
         }
     }

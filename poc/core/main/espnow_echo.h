@@ -23,6 +23,10 @@ typedef struct {
 esp_err_t espnow_transport_start(void);
 
 bool espnow_transport_get_last_rssi(int8_t *rssi);
+bool espnow_transport_get_last_rx(
+    int8_t *rssi,
+    uint32_t *age_seconds
+);
 
 bool espnow_transport_receive_message(
     espnow_hid_message_t *message,

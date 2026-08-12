@@ -25,6 +25,12 @@
 
 
 #define ESPNOW_CHANNEL         6
+#define ESPNOW_PROTOCOLS       ( \
+    WIFI_PROTOCOL_11B | \
+    WIFI_PROTOCOL_11G | \
+    WIFI_PROTOCOL_11N | \
+    WIFI_PROTOCOL_LR \
+)
 #define RESPONSE_TIMEOUT_MS    5000
 #define TEST_INTERVAL_MS       3000
 #define HID_READ_LENGTH        64
@@ -35,6 +41,11 @@
 #define SERIAL_RAW_MAX         (SERIAL_INNER_MAX + 2)
 #define SERIAL_ENCODED_MAX     (SERIAL_RAW_MAX + (SERIAL_RAW_MAX / 254) + 1)
 #define STICKS3_BUTTON_A_GPIO  GPIO_NUM_11
+#define DIAGNOSTIC_MAGIC       0xD2
+#define SURVEY_SET_REQUEST     0x01
+#define SURVEY_SET_RESPONSE    0x02
+#define SURVEY_INTERVAL_MS     1000
+#define SURVEY_RESPONSE_MS     800
 
 
 typedef struct {
@@ -398,6 +409,15 @@ static esp_err_t initialise_espnow(void)
         return err;
     }
 
+    err = esp_wifi_set_protocol(
+        WIFI_IF_STA,
+        ESPNOW_PROTOCOLS
+    );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
     receive_queue = xQueueCreate(
         1,
         sizeof(received_frame_t)
@@ -433,7 +453,23 @@ static esp_err_t initialise_espnow(void)
     peer.channel = ESPNOW_CHANNEL;
     peer.encrypt = false;
 
-    return esp_now_add_peer(&peer);
+    err = esp_now_add_peer(&peer);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_now_rate_config_t rate_config = {
+        .phymode = WIFI_PHY_MODE_LR,
+        .rate = WIFI_PHY_RATE_LORA_250K,
+        .ersu = false,
+        .dcm = false
+    };
+
+    return esp_now_set_peer_rate_config(
+        broadcast_address,
+        &rate_config
+    );
 }
 
 static uint16_t crc16_ccitt_false(
@@ -746,6 +782,173 @@ static bool serial_read_inner(
 }
 
 
+static bool survey_arm_request(
+    const uint8_t *inner,
+    size_t inner_length,
+    uint32_t *request_id
+)
+{
+    if (
+        inner_length != HID_TUNNEL_HEADER_SIZE + 1 ||
+        inner[0] != DIAGNOSTIC_MAGIC ||
+        inner[1] != SURVEY_SET_REQUEST ||
+        hid_tunnel_get_u16(&inner[6]) != 1 ||
+        inner[HID_TUNNEL_HEADER_SIZE] != 1
+    ) {
+        return false;
+    }
+
+    *request_id = hid_tunnel_get_u32(&inner[2]);
+    return true;
+}
+
+
+static bool send_survey_arm_response(uint32_t request_id)
+{
+    uint8_t response[HID_TUNNEL_HEADER_SIZE + 1];
+
+    response[0] = DIAGNOSTIC_MAGIC;
+    response[1] = SURVEY_SET_RESPONSE;
+    hid_tunnel_put_u32(&response[2], request_id);
+    hid_tunnel_put_u16(&response[6], 1);
+    response[HID_TUNNEL_HEADER_SIZE] = 0;
+
+    return serial_send_inner(response, sizeof(response));
+}
+
+
+static void show_survey(
+    uint32_t sent,
+    uint32_t received,
+    uint32_t missed,
+    const char *state,
+    bool error
+)
+{
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setTextSize(2);
+    display.setCursor(8, 6);
+    display.println("DAMspy SURVEY");
+    display.println("Standalone ACTIVE");
+    display.println("Disconnect USB");
+    display.printf(
+        "TX:%lu RX:%lu MISS:%lu\n",
+        (unsigned long)sent,
+        (unsigned long)received,
+        (unsigned long)missed
+    );
+    display.setTextColor(error ? TFT_RED : TFT_GREEN, TFT_BLACK);
+    display.println(state);
+}
+
+
+static void run_survey(void)
+{
+    uint32_t sent = 0;
+    uint32_t received_count = 0;
+    uint32_t missed = 0;
+    uint32_t request_id = 1;
+
+    show_survey(0, 0, 0, "STARTING", false);
+
+    while (1) {
+        int64_t cycle_start_us = esp_timer_get_time();
+        uint8_t request[HID_TUNNEL_HEADER_SIZE];
+        size_t request_length = hid_tunnel_encode(
+            request,
+            sizeof(request),
+            HID_TUNNEL_STATUS_REQUEST,
+            request_id,
+            NULL,
+            0
+        );
+
+        xQueueReset(receive_queue);
+        esp_err_t err = esp_now_send(
+            broadcast_address,
+            request,
+            request_length
+        );
+
+        bool matched = false;
+
+        if (err == ESP_OK) {
+            sent++;
+            int64_t deadline_us =
+                esp_timer_get_time() +
+                ((int64_t)SURVEY_RESPONSE_MS * 1000);
+
+            while (esp_timer_get_time() < deadline_us) {
+                int64_t remaining_us =
+                    deadline_us - esp_timer_get_time();
+                received_frame_t received = {};
+
+                if (
+                    xQueueReceive(
+                        receive_queue,
+                        &received,
+                        pdMS_TO_TICKS(
+                            (remaining_us + 999) / 1000
+                        )
+                    ) != pdTRUE
+                ) {
+                    break;
+                }
+
+                hid_tunnel_message_t response = {};
+
+                if (
+                    hid_tunnel_decode(
+                        received.data,
+                        received.length,
+                        &response
+                    ) &&
+                    response.type ==
+                        HID_TUNNEL_STATUS_RESPONSE &&
+                    response.request_id == request_id
+                ) {
+                    matched = true;
+                    received_count++;
+                    break;
+                }
+            }
+        }
+
+        if (!matched) {
+            missed++;
+        }
+
+        show_survey(
+            sent,
+            received_count,
+            missed,
+            matched ? "STATUS OK" : "NO RESPONSE",
+            !matched
+        );
+
+        request_id =
+            request_id == UINT32_MAX
+            ? 1
+            : request_id + 1;
+
+        int64_t elapsed_us =
+            esp_timer_get_time() - cycle_start_us;
+        int64_t remaining_us =
+            ((int64_t)SURVEY_INTERVAL_MS * 1000) -
+            elapsed_us;
+
+        if (remaining_us > 0) {
+            vTaskDelay(
+                pdMS_TO_TICKS(
+                    (remaining_us + 999) / 1000
+                )
+            );
+        }
+    }
+}
+
+
 static void show_bridge(
     uint32_t forwarded,
     uint32_t returned,
@@ -805,6 +1008,35 @@ static void run_bridge(void)
                 0, 0, "BAD SERIAL FRAME", true
             );
             continue;
+        }
+
+        uint32_t survey_request_id = 0;
+
+        if (
+            survey_arm_request(
+                inner,
+                inner_length,
+                &survey_request_id
+            )
+        ) {
+            if (!send_survey_arm_response(survey_request_id)) {
+                show_bridge(
+                    forwarded, returned, rejected + 1,
+                    SURVEY_SET_REQUEST,
+                    survey_request_id,
+                    "SURVEY ACK FAIL", true
+                );
+                continue;
+            }
+
+            show_bridge(
+                forwarded, returned, rejected,
+                SURVEY_SET_REQUEST,
+                survey_request_id,
+                "SURVEY ARMED", false
+            );
+            vTaskDelay(pdMS_TO_TICKS(250));
+            run_survey();
         }
 
         hid_tunnel_message_t request = {};

@@ -11,6 +11,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_now.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
@@ -19,6 +20,12 @@
 
 #define ESPNOW_CHANNEL         6
 #define ESPNOW_QUEUE_LENGTH    4
+#define ESPNOW_PROTOCOLS       ( \
+    WIFI_PROTOCOL_11B | \
+    WIFI_PROTOCOL_11G | \
+    WIFI_PROTOCOL_11N | \
+    WIFI_PROTOCOL_LR \
+)
 
 
 typedef struct {
@@ -34,6 +41,7 @@ static QueueHandle_t receive_queue = NULL;
 static portMUX_TYPE rssi_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool last_rssi_valid = false;
 static int8_t last_rssi = 0;
+static int64_t last_rx_time_us = 0;
 
 
 /* Wi-Fi task context: validate, copy, and queue only. */
@@ -56,6 +64,7 @@ static void espnow_receive_callback(
     if (info->rx_ctrl != NULL) {
         taskENTER_CRITICAL(&rssi_lock);
         last_rssi = info->rx_ctrl->rssi;
+        last_rx_time_us = esp_timer_get_time();
         last_rssi_valid = true;
         taskEXIT_CRITICAL(&rssi_lock);
     }
@@ -68,6 +77,33 @@ static void espnow_receive_callback(
     memcpy(frame.data, data, data_length);
 
     (void)xQueueSend(receive_queue, &frame, 0);
+}
+
+
+bool espnow_transport_get_last_rx(
+    int8_t *rssi,
+    uint32_t *age_seconds
+)
+{
+    if (rssi == NULL || age_seconds == NULL) {
+        return false;
+    }
+
+    taskENTER_CRITICAL(&rssi_lock);
+    bool valid = last_rssi_valid;
+    *rssi = last_rssi;
+    int64_t received_us = last_rx_time_us;
+    taskEXIT_CRITICAL(&rssi_lock);
+
+    if (!valid) {
+        return false;
+    }
+
+    int64_t age_us = esp_timer_get_time() - received_us;
+    *age_seconds = age_us > 0
+        ? (uint32_t)(age_us / 1000000)
+        : 0;
+    return true;
 }
 
 
@@ -90,18 +126,32 @@ static esp_err_t ensure_peer(
     const uint8_t peer_address[ESP_NOW_ETH_ALEN]
 )
 {
-    if (esp_now_is_peer_exist(peer_address)) {
-        return ESP_OK;
+    if (!esp_now_is_peer_exist(peer_address)) {
+        esp_now_peer_info_t peer = {0};
+
+        memcpy(peer.peer_addr, peer_address, ESP_NOW_ETH_ALEN);
+        peer.ifidx = WIFI_IF_STA;
+        peer.channel = ESPNOW_CHANNEL;
+        peer.encrypt = false;
+
+        esp_err_t err = esp_now_add_peer(&peer);
+
+        if (err != ESP_OK) {
+            return err;
+        }
     }
 
-    esp_now_peer_info_t peer = {0};
+    esp_now_rate_config_t rate_config = {
+        .phymode = WIFI_PHY_MODE_LR,
+        .rate = WIFI_PHY_RATE_LORA_250K,
+        .ersu = false,
+        .dcm = false
+    };
 
-    memcpy(peer.peer_addr, peer_address, ESP_NOW_ETH_ALEN);
-    peer.ifidx = WIFI_IF_STA;
-    peer.channel = ESPNOW_CHANNEL;
-    peer.encrypt = false;
-
-    return esp_now_add_peer(&peer);
+    return esp_now_set_peer_rate_config(
+        peer_address,
+        &rate_config
+    );
 }
 
 
@@ -235,6 +285,15 @@ esp_err_t espnow_transport_start(void)
     err = esp_wifi_set_channel(
         ESPNOW_CHANNEL,
         WIFI_SECOND_CHAN_NONE
+    );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_wifi_set_protocol(
+        WIFI_IF_STA,
+        ESPNOW_PROTOCOLS
     );
 
     if (err != ESP_OK) {
