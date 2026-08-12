@@ -221,6 +221,31 @@ static void screen_printf(const char *format, ...)
 }
 
 
+static void format_last_rssi(
+    char *buffer,
+    size_t buffer_size
+)
+{
+    int8_t rssi;
+
+    if (espnow_transport_get_last_rssi(&rssi)) {
+        snprintf(
+            buffer,
+            buffer_size,
+            "RX RSSI: %d dBm",
+            rssi
+        );
+    }
+    else {
+        snprintf(
+            buffer,
+            buffer_size,
+            "RX RSSI: -- (none)"
+        );
+    }
+}
+
+
 /* ============================================================
  * Fatal error
  * ============================================================ */
@@ -984,6 +1009,9 @@ static void show_battery_response(
 )
 {
     char hex[200];
+    char rssi_text[32];
+
+    format_last_rssi(rssi_text, sizeof(rssi_text));
 
     int pos = 0;
 
@@ -1065,7 +1093,7 @@ static void show_battery_response(
             "Temp: %u C\n"
             "State: 0x%02X\n"
             "Current: %u mA\n\n"
-            "Core: %d%%  %.3f V\n\n"
+            "Core: %d%%  %.3f V   %s\n\n"
             "RX %d bytes:\n"
             "%s",
             battery_mv,
@@ -1074,6 +1102,7 @@ static void show_battery_response(
             charge_current_ma,
             core_percent,
             core_voltage,
+            rssi_text,
             length,
             hex
         );
@@ -1085,11 +1114,12 @@ static void show_battery_response(
             "Unexpected reply\n\n"
             "RX %d bytes:\n"
             "%s\n\n"
-            "Core: %d%%  %.3f V",
+            "Core: %d%%  %.3f V   %s",
             length,
             hex,
             core_percent,
-            core_voltage
+            core_voltage,
+            rssi_text
         );
     }
 }
@@ -1500,7 +1530,6 @@ static void inspect_usb_device(
         err != ESP_OK ||
         dev_desc == NULL
     ) {
-
         screen_printf(
             "DESCRIPTOR ERROR\n\n"
             "%s",
@@ -1702,6 +1731,9 @@ static void inspect_usb_device(
         dev_desc->idProduct ==
             WIRELESS_PRO_RX_PID
     ) {
+        char rssi_text[32];
+
+        format_last_rssi(rssi_text, sizeof(rssi_text));
 
         screen_printf(
             "WIRELESS PRO READY\n\n"
@@ -1710,6 +1742,7 @@ static void inspect_usb_device(
             "SN: %s\n\n"
             "HID IF %d\n"
             "IN EP 0x%02X MPS %u\n\n"
+            "%s\n\n"
             "Waiting for tunnel test",
             dev_desc->idVendor,
             dev_desc->idProduct,
@@ -1717,7 +1750,8 @@ static void inspect_usb_device(
             serial,
             hid.interface_number,
             hid.in_endpoint,
-            hid.in_mps
+            hid.in_mps,
+            rssi_text
         );
     }
     else {

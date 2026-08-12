@@ -31,6 +31,9 @@ typedef struct {
 static const char *TAG = "espnow_transport";
 
 static QueueHandle_t receive_queue = NULL;
+static portMUX_TYPE rssi_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool last_rssi_valid = false;
+static int8_t last_rssi = 0;
 
 
 /* Wi-Fi task context: validate, copy, and queue only. */
@@ -50,6 +53,13 @@ static void espnow_receive_callback(
         return;
     }
 
+    if (info->rx_ctrl != NULL) {
+        taskENTER_CRITICAL(&rssi_lock);
+        last_rssi = info->rx_ctrl->rssi;
+        last_rssi_valid = true;
+        taskEXIT_CRITICAL(&rssi_lock);
+    }
+
     espnow_frame_t frame = {
         .length = data_length
     };
@@ -58,6 +68,21 @@ static void espnow_receive_callback(
     memcpy(frame.data, data, data_length);
 
     (void)xQueueSend(receive_queue, &frame, 0);
+}
+
+
+bool espnow_transport_get_last_rssi(int8_t *rssi)
+{
+    if (rssi == NULL) {
+        return false;
+    }
+
+    taskENTER_CRITICAL(&rssi_lock);
+    bool valid = last_rssi_valid;
+    *rssi = last_rssi;
+    taskEXIT_CRITICAL(&rssi_lock);
+
+    return valid;
 }
 
 
