@@ -22,6 +22,7 @@
 #include "M5GFX.h"
 
 #include "hid_tunnel_protocol.h"
+#include "espnow_ota_protocol.h"
 
 
 #define ESPNOW_CHANNEL         6
@@ -629,6 +630,31 @@ static bool valid_serial_request(
 }
 
 
+static bool valid_ota_serial_request(
+    const uint8_t *inner,
+    size_t inner_length,
+    espnow_ota_message_t *message
+)
+{
+    if (!espnow_ota_decode(inner, inner_length, message)) {
+        return false;
+    }
+
+    switch (message->type) {
+        case ESPNOW_OTA_BEGIN_REQUEST:
+            return message->body_length == ESPNOW_OTA_BEGIN_BODY_SIZE;
+        case ESPNOW_OTA_DATA_REQUEST:
+            return message->body_length > ESPNOW_OTA_DATA_OVERHEAD;
+        case ESPNOW_OTA_END_REQUEST:
+        case ESPNOW_OTA_ABORT_REQUEST:
+        case ESPNOW_OTA_STATUS_REQUEST:
+            return message->body_length == 0;
+        default:
+            return false;
+    }
+}
+
+
 static uint8_t expected_response_type(uint8_t request_type)
 {
     return request_type + 1;
@@ -1039,50 +1065,40 @@ static void run_bridge(void)
             run_survey();
         }
 
-        hid_tunnel_message_t request = {};
+        hid_tunnel_message_t hid_request = {};
+        espnow_ota_message_t ota_request = {};
+        bool is_hid = valid_serial_request(inner, inner_length, &hid_request);
+        bool is_ota = valid_ota_serial_request(inner, inner_length, &ota_request);
 
-        if (
-            !valid_serial_request(
-                inner,
-                inner_length,
-                &request
-            )
-        ) {
+        if (!is_hid && !is_ota) {
             rejected++;
-            show_bridge(
-                forwarded, returned, rejected,
-                0, 0, "BAD REQUEST", true
-            );
+            show_bridge(forwarded, returned, rejected, 0, 0,
+                "BAD REQUEST", true);
             continue;
         }
 
+        uint8_t request_type = is_ota ? ota_request.type : hid_request.type;
+        uint32_t request_id = is_ota ? ota_request.request_id : hid_request.request_id;
+        uint32_t operation_timeout_ms = is_ota
+            ? (request_type == ESPNOW_OTA_BEGIN_REQUEST ? 30000 : 10000)
+            : response_timeout_ms(&hid_request);
+
         xQueueReset(receive_queue);
-        esp_err_t err = esp_now_send(
-            broadcast_address,
-            inner,
-            inner_length
-        );
+        esp_err_t err = esp_now_send(broadcast_address, inner, inner_length);
 
         if (err != ESP_OK) {
             rejected++;
-            show_bridge(
-                forwarded, returned, rejected,
-                request.type, request.request_id,
-                "ESP-NOW SEND FAIL", true
-            );
+            show_bridge(forwarded, returned, rejected, request_type, request_id,
+                "ESP-NOW SEND FAIL", true);
             continue;
         }
 
         forwarded++;
-        show_bridge(
-            forwarded, returned, rejected,
-            request.type, request.request_id,
-            "WAITING", false
-        );
+        show_bridge(forwarded, returned, rejected, request_type, request_id,
+            is_ota ? "OTA WAITING" : "WAITING", false);
 
-        int64_t deadline_us =
-            esp_timer_get_time() +
-            ((int64_t)response_timeout_ms(&request) * 1000);
+        int64_t deadline_us = esp_timer_get_time() +
+            ((int64_t)operation_timeout_ms * 1000);
         bool matched = false;
 
         while (esp_timer_get_time() < deadline_us) {
@@ -1108,17 +1124,13 @@ static void run_bridge(void)
                 break;
             }
 
-            hid_tunnel_message_t response = {};
-
             if (
-                !hid_tunnel_decode(
-                    received.data,
-                    received.length,
-                    &response
-                ) ||
-                response.type !=
-                    expected_response_type(request.type) ||
-                response.request_id != request.request_id
+                received.length < HID_TUNNEL_HEADER_SIZE ||
+                received.data[0] != (is_ota ? ESPNOW_OTA_MAGIC : HID_TUNNEL_MAGIC) ||
+                received.data[1] != expected_response_type(request_type) ||
+                hid_tunnel_get_u32(&received.data[2]) != request_id ||
+                received.length != HID_TUNNEL_HEADER_SIZE +
+                    hid_tunnel_get_u16(&received.data[6])
             ) {
                 continue;
             }
@@ -1134,15 +1146,15 @@ static void run_bridge(void)
                 returned++;
                 show_bridge(
                     forwarded, returned, rejected,
-                    request.type, request.request_id,
-                    "RESPONSE SENT", false
+                    request_type, request_id,
+                    is_ota ? "OTA RESPONSE" : "RESPONSE SENT", false
                 );
             }
             else {
                 rejected++;
                 show_bridge(
                     forwarded, returned, rejected,
-                    request.type, request.request_id,
+                    request_type, request_id,
                     "SERIAL SEND FAIL", true
                 );
             }
@@ -1154,8 +1166,8 @@ static void run_bridge(void)
             rejected++;
             show_bridge(
                 forwarded, returned, rejected,
-                request.type, request.request_id,
-                "LINK TIMEOUT", true
+                request_type, request_id,
+                is_ota ? "OTA TIMEOUT" : "LINK TIMEOUT", true
             );
         }
     }

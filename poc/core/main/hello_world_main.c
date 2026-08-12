@@ -24,6 +24,8 @@
 #include "usb/usb_types_ch9.h"
 
 #include "espnow_echo.h"
+#include "core_ota.h"
+#include "espnow_ota_protocol.h"
 
 
 /* ============================================================
@@ -1989,10 +1991,16 @@ void app_main(void)
      * ======================================================== */
 
     bool grove_host_mode = false;
+    bool espnow_started = false;
 
     if (power.vbus_present) {
 
         cores3_usb_power(false);
+        err = espnow_transport_start();
+        if (err != ESP_OK) {
+            fatal_error("ESP-NOW maintenance", err);
+        }
+        espnow_started = true;
         show_grove_host_button();
 
         while (!grove_host_selected) {
@@ -2027,7 +2035,12 @@ void app_main(void)
                 );
             }
 
-            vTaskDelay(pdMS_TO_TICKS(250));
+            espnow_hid_message_t maintenance_request;
+            if (espnow_transport_receive_message(&maintenance_request, 0)) {
+                (void)core_ota_handle_message(&maintenance_request, false);
+            }
+            core_ota_poll();
+            vTaskDelay(pdMS_TO_TICKS(25));
         }
 
         err = read_core_power(&power);
@@ -2108,13 +2121,16 @@ void app_main(void)
         fatal_error("HID response queue", ESP_ERR_NO_MEM);
     }
 
-    err = espnow_transport_start();
+    if (!espnow_started) {
+        err = espnow_transport_start();
 
-    if (err != ESP_OK) {
-        fatal_error(
-            "ESP-NOW transport",
-            err
-        );
+        if (err != ESP_OK) {
+            fatal_error(
+                "ESP-NOW transport",
+                err
+            );
+        }
+        espnow_started = true;
     }
 
     if (
@@ -2371,9 +2387,14 @@ void app_main(void)
         }
 
 
+        core_ota_poll();
         espnow_hid_message_t request;
 
         if (espnow_transport_receive_message(&request, 0)) {
+            if (core_ota_handle_message(&request, battery_transaction_active)) {
+                continue;
+            }
+
             uint8_t result = HID_TUNNEL_RESULT_OK;
             uint8_t response_type = 0;
             uint8_t response_body[HID_TUNNEL_STATUS_RESPONSE_SIZE] = {0};

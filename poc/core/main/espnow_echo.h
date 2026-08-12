@@ -13,6 +13,7 @@
 
 typedef struct {
     uint8_t source[ESP_NOW_ETH_ALEN];
+    uint8_t magic;
     uint8_t type;
     uint32_t request_id;
     size_t body_length;
@@ -39,4 +40,9 @@ esp_err_t espnow_transport_send_message(
     uint32_t request_id,
     const uint8_t *body,
     size_t body_length
+);
+
+esp_err_t espnow_transport_send_ota_message(
+    const uint8_t destination[ESP_NOW_ETH_ALEN], uint8_t type,
+    uint32_t request_id, const uint8_t *body, size_t body_length
 );

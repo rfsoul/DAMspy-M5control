@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 
 #include "espnow_echo.h"
+#include "espnow_ota_protocol.h"
 
 
 #define ESPNOW_CHANNEL         6
@@ -176,24 +177,22 @@ bool espnow_transport_receive_message(
         return false;
     }
 
-    hid_tunnel_message_t decoded;
-
     if (
-        !hid_tunnel_decode(
-            frame.data,
-            frame.length,
-            &decoded
-        )
+        frame.length < HID_TUNNEL_HEADER_SIZE ||
+        (frame.data[0] != HID_TUNNEL_MAGIC && frame.data[0] != ESPNOW_OTA_MAGIC) ||
+        hid_tunnel_get_u16(&frame.data[6]) > HID_TUNNEL_MAX_BODY ||
+        frame.length != HID_TUNNEL_HEADER_SIZE + hid_tunnel_get_u16(&frame.data[6])
     ) {
         ESP_LOGW(TAG, "discarding invalid transport frame");
         return false;
     }
 
     memcpy(message->source, frame.source, ESP_NOW_ETH_ALEN);
-    message->type = decoded.type;
-    message->request_id = decoded.request_id;
-    message->body_length = decoded.body_length;
-    memcpy(message->body, decoded.body, decoded.body_length);
+    message->magic = frame.data[0];
+    message->type = frame.data[1];
+    message->request_id = hid_tunnel_get_u32(&frame.data[2]);
+    message->body_length = hid_tunnel_get_u16(&frame.data[6]);
+    memcpy(message->body, &frame.data[HID_TUNNEL_HEADER_SIZE], message->body_length);
 
     return true;
 }
@@ -233,6 +232,20 @@ esp_err_t espnow_transport_send_message(
         frame,
         frame_length
     );
+}
+
+
+esp_err_t espnow_transport_send_ota_message(
+    const uint8_t destination[ESP_NOW_ETH_ALEN], uint8_t type,
+    uint32_t request_id, const uint8_t *body, size_t body_length)
+{
+    uint8_t frame[ESP_NOW_MAX_DATA_LEN];
+    size_t frame_length = espnow_ota_encode(
+        frame, sizeof(frame), type, request_id, body, body_length);
+    if (frame_length == 0) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = ensure_peer(destination);
+    if (err != ESP_OK) return err;
+    return esp_now_send(destination, frame, frame_length);
 }
 
 
