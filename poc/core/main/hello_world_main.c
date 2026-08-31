@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
 #include "esp_timer.h"
+#include "esp_ota_ops.h"
 
 #include "driver/i2c_master.h"
 
@@ -129,6 +130,7 @@ static usb_transfer_t *battery_input_transfer = NULL;
 
 static bool battery_transaction_active = false;
 static size_t active_write_length = 0;
+static int64_t active_write_deadline_us = 0;
 static uint16_t active_read_length = 0;
 static uint32_t active_read_timeout_ms = 0;
 static int64_t active_read_deadline_us = 0;
@@ -1395,6 +1397,7 @@ static void battery_control_callback(
         result == HID_TUNNEL_RESULT_OK ? active_write_length : 0
     );
 
+    active_write_deadline_us = 0;
     battery_transaction_active = false;
 }
 
@@ -1457,6 +1460,8 @@ static esp_err_t hid_set_report_transaction(
     battery_control_transfer->num_bytes = 8 + request_length;
 
     active_write_length = request_length;
+    active_write_deadline_us =
+        esp_timer_get_time() + 1000000;
     active_request_id = transaction_id;
     active_tunnel_transaction = tunnel_transaction;
 
@@ -1476,6 +1481,7 @@ static esp_err_t hid_set_report_transaction(
 
     if (err != ESP_OK) {
         battery_transaction_active = false;
+        active_write_deadline_us = 0;
     }
 
     return err;
@@ -1649,6 +1655,55 @@ static void usb_client_event_cb(
  * Inspect device and prepare the HID interface
  * ============================================================ */
 
+static bool find_rode_device_address(uint8_t *address_out)
+{
+    uint8_t addresses[8] = {0};
+    int address_count = 0;
+
+    if (
+        address_out == NULL ||
+        usb_host_device_addr_list_fill(
+            sizeof(addresses),
+            addresses,
+            &address_count
+        ) != ESP_OK
+    ) {
+        return false;
+    }
+
+    for (int index = 0; index < address_count; index++) {
+        usb_device_handle_t candidate = NULL;
+
+        if (
+            usb_host_device_open(
+                client_hdl,
+                addresses[index],
+                &candidate
+            ) != ESP_OK
+        ) {
+            continue;
+        }
+
+        const usb_device_desc_t *descriptor = NULL;
+        esp_err_t descriptor_err =
+            usb_host_get_device_descriptor(candidate, &descriptor);
+
+        bool is_rode =
+            descriptor_err == ESP_OK &&
+            descriptor != NULL &&
+            descriptor->idVendor == RODE_VID;
+
+        usb_host_device_close(client_hdl, candidate);
+
+        if (is_rode) {
+            *address_out = addresses[index];
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void inspect_usb_device(
     uint8_t address
 )
@@ -1706,6 +1761,23 @@ static void inspect_usb_device(
             esp_err_to_name(err)
         );
 
+        return;
+    }
+
+    if (dev_desc->idVendor != RODE_VID) {
+        ESP_LOGI(
+            TAG,
+            "ignoring non-RODE USB device %04X:%04X at address %u",
+            dev_desc->idVendor,
+            dev_desc->idProduct,
+            address
+        );
+
+        usb_host_device_close(client_hdl, device_hdl);
+        device_hdl = NULL;
+        usb_connected = false;
+        connected_vid = 0;
+        connected_pid = 0;
         return;
     }
 
@@ -1948,6 +2020,20 @@ void app_main(void)
 {
     esp_err_t err;
 
+    esp_err_t ota_valid_err =
+        esp_ota_mark_app_valid_cancel_rollback();
+
+    if (
+        ota_valid_err != ESP_OK &&
+        ota_valid_err != ESP_ERR_NOT_SUPPORTED
+    ) {
+        ESP_LOGW(
+            TAG,
+            "OTA validity confirmation: %s",
+            esp_err_to_name(ota_valid_err)
+        );
+    }
+
 
     /* --------------------------------------------------------
      * Display
@@ -2065,12 +2151,10 @@ void app_main(void)
             "GROVE HOST MODE\n\n"
             "External 5V: YES\n"
             "Core: %d%% %.3fV\n\n"
-            "Enabling DUT VBUS...",
+            "Preparing USB host...",
             power.battery_percent,
             power.battery_voltage
         );
-
-        cores3_grove_host_power();
     }
     else {
         /*
@@ -2224,6 +2308,17 @@ void app_main(void)
         }
     }
 
+    if (grove_host_mode) {
+        screen_printf(
+            "DAMspy M5 Control\n\n"
+            "GROVE HOST MODE\n\n"
+            "USB host ready\n\n"
+            "Enabling DUT VBUS..."
+        );
+
+        cores3_grove_host_power();
+    }
+
 
     screen_printf(
         "DAMspy M5 Control\n\n"
@@ -2240,6 +2335,11 @@ void app_main(void)
     /* --------------------------------------------------------
      * Event loop
      * -------------------------------------------------------- */
+
+    int64_t next_usb_scan_us = 0;
+    int64_t cold_attach_recovery_deadline_us =
+        esp_timer_get_time() + 8000000;
+    bool cold_attach_recovery_done = false;
 
     while (1) {
 
@@ -2265,6 +2365,64 @@ void app_main(void)
                 "client events: %s",
                 esp_err_to_name(err)
             );
+        }
+
+
+        if (
+            battery_transaction_active &&
+            active_write_deadline_us > 0 &&
+            esp_timer_get_time() >= active_write_deadline_us
+        ) {
+            uint8_t timeout_body[HID_TUNNEL_WRITE_RESPONSE_SIZE] = {
+                HID_TUNNEL_RESULT_USB_ERROR,
+                0,
+                0
+            };
+
+            active_write_deadline_us = 0;
+
+            if (active_tunnel_transaction) {
+                esp_err_t send_err = espnow_transport_send_message(
+                    active_requester,
+                    HID_TUNNEL_WRITE_RESPONSE,
+                    active_request_id,
+                    timeout_body,
+                    sizeof(timeout_body)
+                );
+
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "WRITE timeout response: %s",
+                        esp_err_to_name(send_err)
+                    );
+                }
+            }
+
+            /* Suppress a duplicate tunnel response from the cancellation
+             * callback while the root-port restart discards endpoint zero. */
+            active_tunnel_transaction = false;
+            usb_connected = false;
+            hid_ready = false;
+
+            ESP_LOGW(TAG, "SET_REPORT timed out; restarting USB root port");
+            esp_err_t root_off_err =
+                usb_host_lib_set_root_port_power(false);
+            vTaskDelay(pdMS_TO_TICKS(250));
+            esp_err_t root_on_err =
+                usb_host_lib_set_root_port_power(true);
+
+            if (
+                root_off_err != ESP_OK ||
+                root_on_err != ESP_OK
+            ) {
+                ESP_LOGE(
+                    TAG,
+                    "WRITE USB recovery: off=%s on=%s",
+                    esp_err_to_name(root_off_err),
+                    esp_err_to_name(root_on_err)
+                );
+            }
         }
 
 
@@ -2362,10 +2520,17 @@ void app_main(void)
                     );
                     body_length += hid_response.length;
 
-                    show_battery_response(
-                        hid_response.data,
-                        hid_response.length
-                    );
+                    if (
+                        hid_response.length >= 3 &&
+                        hid_response.data[0] == BATTERY_RESPONSE_REPORT_ID &&
+                        hid_response.data[1] == BATTERY_COMMAND &&
+                        hid_response.data[2] == 0x41
+                    ) {
+                        show_battery_response(
+                            hid_response.data,
+                            hid_response.length
+                        );
+                    }
                 }
 
                 esp_err_t send_err = espnow_transport_send_message(
@@ -2521,18 +2686,75 @@ void app_main(void)
          */
 
         if (
-            pending_device_address >= 0 &&
-            device_hdl == NULL
+            device_hdl == NULL &&
+            (
+                pending_device_address >= 0 ||
+                esp_timer_get_time() >= next_usb_scan_us
+            )
         ) {
+            pending_device_address = -1;
+            next_usb_scan_us =
+                esp_timer_get_time() + 500000;
 
-            int address =
-                pending_device_address;
+            uint8_t rode_address = 0;
+
+            if (
+                find_rode_device_address(&rode_address)
+            ) {
+                inspect_usb_device(rode_address);
+            }
+        }
+
+
+        /*
+         * Some composite RODE products expose an external hub before their
+         * HID function. If that hub is already present during host startup,
+         * its first downstream enumeration can stall. Recreate one physical
+         * unplug/replug after a generous startup grace period. Never disturb
+         * a device which has successfully reached the RODE discovery path.
+         */
+        if (
+            grove_host_mode &&
+            !cold_attach_recovery_done &&
+            device_hdl == NULL &&
+            esp_timer_get_time() >= cold_attach_recovery_deadline_us
+        ) {
+            cold_attach_recovery_done = true;
+
+            screen_printf(
+                "DAMspy M5 Control\n\n"
+                "USB HOST RECOVERY\n\n"
+                "Cycling DUT power..."
+            );
+
+            esp_err_t root_off_err =
+                usb_host_lib_set_root_port_power(false);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_err_t root_on_err =
+                usb_host_lib_set_root_port_power(true);
+
+            if (
+                root_off_err != ESP_OK ||
+                root_on_err != ESP_OK
+            ) {
+                ESP_LOGE(
+                    TAG,
+                    "USB root recovery: off=%s on=%s",
+                    esp_err_to_name(root_off_err),
+                    esp_err_to_name(root_on_err)
+                );
+            }
 
             pending_device_address = -1;
+            next_usb_scan_us =
+                esp_timer_get_time() + 500000;
 
-
-            inspect_usb_device(
-                (uint8_t)address
+            screen_printf(
+                "DAMspy M5 Control\n\n"
+                "USB HOST READY\n\n"
+                "Recovery complete\n\n"
+                "Waiting for RODE...\n\n"
+                "Powered from Grove"
             );
         }
 
@@ -2548,6 +2770,7 @@ void app_main(void)
 
             device_gone = false;
             battery_transaction_active = false;
+            active_write_deadline_us = 0;
             active_read_deadline_us = 0;
             read_timeout_cancel_pending = false;
             read_endpoint_needs_clear = false;

@@ -3933,8 +3933,17 @@ CONFIG_USB_HOST_RESUME_RECOVERY_MS=20
 CONFIG_USB_HOST_SUSPEND_ENTRY_MS=20
 # end of Root Port configuration
 
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+# CONFIG_USB_HOST_HUB_MULTI_LEVEL is not set
+
+#
+# Downstream Port configuration
+#
 # default:
-# CONFIG_USB_HOST_HUBS_SUPPORTED is not set
+CONFIG_USB_HOST_EXT_PORT_RESET_RECOVERY_DELAY_MS=30
+# default:
+# CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_ENABLE is not set
+# end of Downstream Port configuration
 # end of Hub Driver Configuration
 
 #
