@@ -6,10 +6,13 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_intr_alloc.h"
+#include "esp_timer.h"
+#include "esp_ota_ops.h"
 
 #include "driver/i2c_master.h"
 
@@ -20,6 +23,10 @@
 
 #include "usb/usb_host.h"
 #include "usb/usb_types_ch9.h"
+
+#include "espnow_echo.h"
+#include "core_ota.h"
+#include "espnow_ota_protocol.h"
 
 
 /* ============================================================
@@ -100,6 +107,9 @@ static const uint8_t wireless_pro_battery_request[BATTERY_REQUEST_LENGTH] = {
 static const char *TAG = "DAMspy";
 
 static lv_obj_t *status_label = NULL;
+static lv_obj_t *telemetry_label = NULL;
+static lv_obj_t *grove_host_button = NULL;
+static volatile bool grove_host_selected = false;
 
 static i2c_master_dev_handle_t axp_dev = NULL;
 static i2c_master_dev_handle_t aw_dev = NULL;
@@ -119,6 +129,34 @@ static usb_transfer_t *battery_control_transfer = NULL;
 static usb_transfer_t *battery_input_transfer = NULL;
 
 static bool battery_transaction_active = false;
+static size_t active_write_length = 0;
+static int64_t active_write_deadline_us = 0;
+static uint16_t active_read_length = 0;
+static uint32_t active_read_timeout_ms = 0;
+static int64_t active_read_deadline_us = 0;
+static bool read_timeout_cancel_pending = false;
+static bool read_endpoint_needs_clear = false;
+static uint32_t active_request_id = 0;
+static uint8_t active_requester[ESP_NOW_ETH_ALEN] = {0};
+static bool active_tunnel_transaction = false;
+static bool usb_connected = false;
+static bool hid_ready = false;
+static uint16_t connected_vid = 0;
+static uint16_t connected_pid = 0;
+
+
+typedef struct {
+    uint8_t destination[ESP_NOW_ETH_ALEN];
+    uint8_t operation;
+    uint8_t result;
+    uint32_t request_id;
+    int length;
+    bool tunnel_transaction;
+    uint8_t data[HID_TUNNEL_MAX_HID_BYTES];
+} hid_response_t;
+
+
+static QueueHandle_t hid_response_queue = NULL;
 
 
 /* ============================================================
@@ -187,6 +225,73 @@ static void screen_printf(const char *format, ...)
     lv_label_set_text(status_label, buffer);
 
     bsp_display_unlock();
+}
+
+
+static void grove_host_button_cb(lv_event_t *event)
+{
+    (void)event;
+    grove_host_selected = true;
+}
+
+
+static void show_grove_host_button(void)
+{
+    bsp_display_lock(0);
+
+    grove_host_button = lv_button_create(lv_screen_active());
+    lv_obj_set_size(grove_host_button, 190, 50);
+    lv_obj_align(grove_host_button, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_add_event_cb(
+        grove_host_button,
+        grove_host_button_cb,
+        LV_EVENT_CLICKED,
+        NULL
+    );
+
+    lv_obj_t *label = lv_label_create(grove_host_button);
+    lv_label_set_text(label, "START GROVE HOST");
+    lv_obj_center(label);
+
+    bsp_display_unlock();
+}
+
+
+static void remove_grove_host_button(void)
+{
+    bsp_display_lock(0);
+
+    if (grove_host_button != NULL) {
+        lv_obj_delete(grove_host_button);
+        grove_host_button = NULL;
+    }
+
+    bsp_display_unlock();
+}
+
+
+static void format_last_rssi(
+    char *buffer,
+    size_t buffer_size
+)
+{
+    int8_t rssi;
+
+    if (espnow_transport_get_last_rssi(&rssi)) {
+        snprintf(
+            buffer,
+            buffer_size,
+            "RX RSSI: %d dBm",
+            rssi
+        );
+    }
+    else {
+        snprintf(
+            buffer,
+            buffer_size,
+            "RX RSSI: -- (none)"
+        );
+    }
 }
 
 
@@ -471,6 +576,89 @@ static esp_err_t read_core_power(
 }
 
 
+static void telemetry_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        core_power_info_t power;
+        int battery_percent = -1;
+
+        if (read_core_power(&power) == ESP_OK) {
+            battery_percent = power.battery_percent;
+        }
+
+        char telemetry[96];
+        int8_t rssi;
+        uint32_t age_seconds;
+
+        if (
+            espnow_transport_get_last_rx(
+                &rssi,
+                &age_seconds
+            )
+        ) {
+            snprintf(
+                telemetry,
+                sizeof(telemetry),
+                "Core: %d%%   RX RSSI: %d dBm (%lu)",
+                battery_percent,
+                rssi,
+                (unsigned long)age_seconds
+            );
+        }
+        else {
+            snprintf(
+                telemetry,
+                sizeof(telemetry),
+                "Core: %d%%   RX RSSI: -- (none)",
+                battery_percent
+            );
+        }
+
+        bsp_display_lock(0);
+
+        if (telemetry_label == NULL) {
+            telemetry_label =
+                lv_label_create(lv_screen_active());
+            lv_obj_set_width(telemetry_label, 310);
+            lv_obj_set_style_text_font(
+                telemetry_label,
+                &lv_font_montserrat_14,
+                0
+            );
+            lv_obj_set_style_text_color(
+                telemetry_label,
+                lv_color_black(),
+                0
+            );
+            lv_obj_set_style_bg_color(
+                telemetry_label,
+                lv_color_white(),
+                0
+            );
+            lv_obj_set_style_bg_opa(
+                telemetry_label,
+                LV_OPA_COVER,
+                0
+            );
+            lv_obj_align(
+                telemetry_label,
+                LV_ALIGN_BOTTOM_LEFT,
+                5,
+                -4
+            );
+        }
+
+        lv_label_set_text(telemetry_label, telemetry);
+        lv_obj_move_foreground(telemetry_label);
+        bsp_display_unlock();
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
 /* ============================================================
  * CoreS3 USB power
  * ============================================================ */
@@ -640,7 +828,7 @@ static void cores3_usb_power(bool enable)
     if (enable) {
 
         /*
-         * Proven sequence:
+         * Proven USB host power-up sequence:
          *
          * BOOST
          * wait
@@ -725,6 +913,46 @@ static void cores3_usb_power(bool enable)
             fatal_error("BOOST OFF", err);
         }
     }
+}
+
+
+static void cores3_grove_host_power(void)
+{
+    /*
+     * External 5 V enters on BUS_OUT. Keep the internal boost and
+     * BUS_OUT switch disabled, then connect that rail to USB VBUS.
+     */
+    cores3_usb_power(false);
+
+    uint8_t out0 = 0;
+    uint8_t out1 = 0;
+    esp_err_t err = i2c_read_pair(
+        aw_dev,
+        AW_REG_OUTPUT_P0,
+        &out0,
+        &out1
+    );
+
+    if (err != ESP_OK) {
+        fatal_error("read Grove host power", err);
+    }
+
+    out0 &= ~BUS_OUT_EN_MASK;
+    out0 |= USB_OTG_EN_MASK;
+    out1 &= ~BOOST_EN_MASK;
+
+    err = i2c_write_pair(
+        aw_dev,
+        AW_REG_OUTPUT_P0,
+        out0,
+        out1
+    );
+
+    if (err != ESP_OK) {
+        fatal_error("Grove host power", err);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(300));
 }
 
 
@@ -953,6 +1181,9 @@ static void show_battery_response(
 )
 {
     char hex[200];
+    char rssi_text[32];
+
+    format_last_rssi(rssi_text, sizeof(rssi_text));
 
     int pos = 0;
 
@@ -1034,7 +1265,7 @@ static void show_battery_response(
             "Temp: %u C\n"
             "State: 0x%02X\n"
             "Current: %u mA\n\n"
-            "Core: %d%%  %.3f V\n\n"
+            "Core: %d%%  %.3f V   %s\n\n"
             "RX %d bytes:\n"
             "%s",
             battery_mv,
@@ -1043,6 +1274,7 @@ static void show_battery_response(
             charge_current_ma,
             core_percent,
             core_voltage,
+            rssi_text,
             length,
             hex
         );
@@ -1054,338 +1286,297 @@ static void show_battery_response(
             "Unexpected reply\n\n"
             "RX %d bytes:\n"
             "%s\n\n"
-            "Core: %d%%  %.3f V",
+            "Core: %d%%  %.3f V   %s",
             length,
             hex,
             core_percent,
-            core_voltage
+            core_voltage,
+            rssi_text
         );
     }
 }
 
 
 /* ============================================================
- * HID battery IN callback
+ * HID completion callbacks
+ *
+ * USB client callback context: copy completion state/data to a queue only.
  * ============================================================ */
+
+static void queue_hid_completion(
+    uint8_t operation,
+    uint8_t result,
+    const uint8_t *data,
+    int length
+)
+{
+    if (hid_response_queue != NULL) {
+        hid_response_t response = {0};
+
+        memcpy(response.destination, active_requester, ESP_NOW_ETH_ALEN);
+        response.operation = operation;
+        response.result = result;
+        response.request_id = active_request_id;
+        response.tunnel_transaction = active_tunnel_transaction;
+        response.length = length;
+
+        if (length > 0 && data != NULL) {
+            memcpy(response.data, data, length);
+        }
+
+        (void)xQueueSend(hid_response_queue, &response, 0);
+    }
+}
+
 
 static void battery_input_callback(
     usb_transfer_t *transfer
 )
 {
-    battery_transaction_active = false;
+    uint8_t result;
 
-
-    if (
-        transfer->status !=
-        USB_TRANSFER_STATUS_COMPLETED
+    if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+        result = HID_TUNNEL_RESULT_OK;
+    }
+    else if (
+        transfer->status == USB_TRANSFER_STATUS_TIMED_OUT ||
+        (
+            transfer->status == USB_TRANSFER_STATUS_CANCELED &&
+            read_timeout_cancel_pending
+        )
     ) {
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY READ FAILED\n\n"
-            "USB status: %d",
-            transfer->status
-        );
-
-        return;
+        result = HID_TUNNEL_RESULT_TIMEOUT;
+    }
+    else {
+        result = HID_TUNNEL_RESULT_USB_ERROR;
     }
 
+    int length = result == HID_TUNNEL_RESULT_OK
+        ? transfer->actual_num_bytes
+        : 0;
 
-    if (
-        transfer->actual_num_bytes <= 0
-    ) {
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY READ FAILED\n\n"
-            "No response bytes"
-        );
-
-        return;
+    if (length > active_read_length) {
+        length = active_read_length;
     }
 
-
-    show_battery_response(
+    queue_hid_completion(
+        HID_TUNNEL_READ_RESPONSE,
+        result,
         transfer->data_buffer,
-        transfer->actual_num_bytes
+        length
     );
+
+    active_read_deadline_us = 0;
+
+    if (!read_endpoint_needs_clear) {
+        battery_transaction_active = false;
+        read_timeout_cancel_pending = false;
+    }
 }
 
 
 /* ============================================================
  * HID SET_REPORT callback
  *
- * Once the battery request has been written successfully,
- * start polling the Wireless PRO interrupt IN endpoint.
+ * SET_REPORT completion is an independent WRITE result. It does not
+ * automatically submit interrupt-IN.
  * ============================================================ */
 
 static void battery_control_callback(
     usb_transfer_t *transfer
 )
 {
-    if (
-        transfer->status !=
-        USB_TRANSFER_STATUS_COMPLETED
-    ) {
+    uint8_t result = transfer->status == USB_TRANSFER_STATUS_COMPLETED
+        ? HID_TUNNEL_RESULT_OK
+        : HID_TUNNEL_RESULT_USB_ERROR;
 
-        battery_transaction_active = false;
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY COMMAND FAILED\n\n"
-            "SET_REPORT status: %d",
-            transfer->status
-        );
-
-        return;
-    }
-
-
-    if (
-        battery_input_transfer == NULL ||
-        hid_in_endpoint == 0 ||
-        hid_in_mps == 0
-    ) {
-
-        battery_transaction_active = false;
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY COMMAND SENT\n\n"
-            "But no HID IN endpoint"
-        );
-
-        return;
-    }
-
-
-    battery_input_transfer->device_handle =
-        device_hdl;
-
-    battery_input_transfer->bEndpointAddress =
-        hid_in_endpoint;
-
-    battery_input_transfer->callback =
-        battery_input_callback;
-
-    battery_input_transfer->context =
-        NULL;
-
-
-    /*
-     * For an IN transfer ESP-IDF requires num_bytes to be
-     * an integer multiple of endpoint MPS.
-     */
-
-    int receive_length = hid_in_mps;
-
-    while (
-        receive_length <
-        BATTERY_REQUEST_LENGTH
-    ) {
-        receive_length += hid_in_mps;
-    }
-
-
-    battery_input_transfer->num_bytes =
-        receive_length;
-
-
-    esp_err_t err =
-        usb_host_transfer_submit(
-            battery_input_transfer
-        );
-
-
-    if (err != ESP_OK) {
-
-        battery_transaction_active = false;
-
-        screen_printf(
-            "WIRELESS PRO\n\n"
-            "BATTERY COMMAND SENT\n\n"
-            "IN submit failed:\n"
-            "%s",
-            esp_err_to_name(err)
-        );
-
-        return;
-    }
-
-
-    screen_printf(
-        "WIRELESS PRO\n\n"
-        "Battery request sent\n\n"
-        "TX:\n"
-        "01 61 00 00 00 00 00 00\n"
-        "00 00 00 00 00 00 00 00 00\n\n"
-        "Waiting for response..."
+    queue_hid_completion(
+        HID_TUNNEL_WRITE_RESPONSE,
+        result,
+        NULL,
+        result == HID_TUNNEL_RESULT_OK ? active_write_length : 0
     );
+
+    active_write_deadline_us = 0;
+    battery_transaction_active = false;
 }
 
 
 /* ============================================================
- * Start Wireless PRO battery request
- *
- * HIDAPI performs this as:
- *
- * bmRequestType = 0x21
- * bRequest      = 0x09      SET_REPORT
- * wValue        = 0x0201    OUTPUT report, ID 1
- * wIndex        = HID interface
- * wLength       = 17
- *
- * Data stage is our 17-byte battery request.
+ * Start one opaque HID SET_REPORT.
  * ============================================================ */
 
-static esp_err_t wireless_pro_read_battery(void)
+static esp_err_t hid_set_report_transaction(
+    const uint8_t *request,
+    size_t request_length,
+    const uint8_t requester[ESP_NOW_ETH_ALEN],
+    uint32_t transaction_id,
+    bool tunnel_transaction
+)
 {
     if (
         device_hdl == NULL ||
         claimed_hid_interface < 0 ||
-        hid_in_endpoint == 0
+        request == NULL ||
+        request_length == 0 ||
+        request_length > HID_TUNNEL_MAX_HID_BYTES
     ) {
-        return ESP_ERR_INVALID_STATE;
+        return ESP_ERR_INVALID_ARG;
     }
-
 
     if (battery_transaction_active) {
         return ESP_ERR_INVALID_STATE;
     }
 
-
-    /*
-     * Control transfer:
-     *
-     * 8-byte setup packet
-     * + 17 byte HID report.
-     */
-
     if (battery_control_transfer == NULL) {
-
-        esp_err_t err =
-            usb_host_transfer_alloc(
-                8 +
-                BATTERY_REQUEST_LENGTH,
-                0,
-                &battery_control_transfer
-            );
+        esp_err_t err = usb_host_transfer_alloc(
+            8 + HID_TUNNEL_MAX_HID_BYTES,
+            0,
+            &battery_control_transfer
+        );
 
         if (err != ESP_OK) {
             return err;
         }
     }
 
-
-    /*
-     * Allocate enough interrupt-IN space.
-     */
-
-    int receive_length = hid_in_mps;
-
-    while (
-        receive_length <
-        BATTERY_REQUEST_LENGTH
-    ) {
-        receive_length += hid_in_mps;
-    }
-
-
-    if (battery_input_transfer == NULL) {
-
-        esp_err_t err =
-            usb_host_transfer_alloc(
-                receive_length,
-                0,
-                &battery_input_transfer
-            );
-
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-
-
-    uint8_t *buf =
-        battery_control_transfer->data_buffer;
-
-
-    /*
-     * USB SETUP packet, little endian.
-     *
-     * 0: bmRequestType = 0x21
-     *      host -> device
-     *      class request
-     *      interface recipient
-     *
-     * 1: bRequest = 0x09 = HID SET_REPORT
-     *
-     * 2/3: wValue = 0x0201
-     *      report type 2 = OUTPUT
-     *      report ID 1
-     *
-     * 4/5: wIndex = HID interface
-     *
-     * 6/7: wLength = 17
-     */
+    uint8_t *buf = battery_control_transfer->data_buffer;
 
     buf[0] = 0x21;
     buf[1] = 0x09;
-
-    buf[2] = BATTERY_REPORT_ID;
+    buf[2] = request[0];
     buf[3] = 0x02;
-
-    buf[4] =
-        claimed_hid_interface & 0xFF;
-
+    buf[4] = claimed_hid_interface & 0xFF;
     buf[5] = 0x00;
+    buf[6] = request_length & 0xFF;
+    buf[7] = (request_length >> 8) & 0xFF;
 
-    buf[6] =
-        BATTERY_REQUEST_LENGTH & 0xFF;
+    memcpy(&buf[8], request, request_length);
 
-    buf[7] = 0x00;
+    battery_control_transfer->device_handle = device_hdl;
+    battery_control_transfer->bEndpointAddress = 0x00;
+    battery_control_transfer->callback = battery_control_callback;
+    battery_control_transfer->context = NULL;
+    battery_control_transfer->num_bytes = 8 + request_length;
 
+    active_write_length = request_length;
+    active_write_deadline_us =
+        esp_timer_get_time() + 1000000;
+    active_request_id = transaction_id;
+    active_tunnel_transaction = tunnel_transaction;
 
-    memcpy(
-        &buf[8],
-        wireless_pro_battery_request,
-        BATTERY_REQUEST_LENGTH
-    );
-
-
-    battery_control_transfer->device_handle =
-        device_hdl;
-
-    battery_control_transfer->bEndpointAddress =
-        0x00;
-
-    battery_control_transfer->callback =
-        battery_control_callback;
-
-    battery_control_transfer->context =
-        NULL;
-
-    battery_control_transfer->num_bytes =
-        8 +
-        BATTERY_REQUEST_LENGTH;
-
+    if (requester != NULL) {
+        memcpy(active_requester, requester, ESP_NOW_ETH_ALEN);
+    }
+    else {
+        memset(active_requester, 0, ESP_NOW_ETH_ALEN);
+    }
 
     battery_transaction_active = true;
 
-
-    esp_err_t err =
-        usb_host_transfer_submit_control(
-            client_hdl,
-            battery_control_transfer
-        );
-
+    esp_err_t err = usb_host_transfer_submit_control(
+        client_hdl,
+        battery_control_transfer
+    );
 
     if (err != ESP_OK) {
         battery_transaction_active = false;
+        active_write_deadline_us = 0;
     }
 
+    return err;
+}
+
+
+/* Start one independent interrupt-IN read. */
+static esp_err_t hid_interrupt_read(
+    uint16_t requested_length,
+    uint32_t timeout_ms,
+    const uint8_t requester[ESP_NOW_ETH_ALEN],
+    uint32_t request_id
+)
+{
+    if (
+        device_hdl == NULL ||
+        claimed_hid_interface < 0 ||
+        hid_in_endpoint == 0 ||
+        hid_in_mps == 0 ||
+        requested_length == 0 ||
+        requested_length > HID_TUNNEL_MAX_HID_BYTES
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (battery_transaction_active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int receive_capacity = hid_in_mps;
+
+    while (receive_capacity < HID_TUNNEL_MAX_HID_BYTES) {
+        receive_capacity += hid_in_mps;
+    }
+
+    if (battery_input_transfer == NULL) {
+        esp_err_t err = usb_host_transfer_alloc(
+            receive_capacity,
+            0,
+            &battery_input_transfer
+        );
+
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    int receive_length = hid_in_mps;
+
+    while (receive_length < requested_length) {
+        receive_length += hid_in_mps;
+    }
+
+    battery_input_transfer->device_handle = device_hdl;
+    battery_input_transfer->bEndpointAddress = hid_in_endpoint;
+    battery_input_transfer->callback = battery_input_callback;
+    battery_input_transfer->context = NULL;
+    battery_input_transfer->num_bytes = receive_length;
+
+    active_read_length = requested_length;
+    active_read_timeout_ms = timeout_ms;
+    active_read_deadline_us =
+        esp_timer_get_time() +
+        ((int64_t)timeout_ms * 1000);
+    read_timeout_cancel_pending = false;
+    read_endpoint_needs_clear = false;
+    active_request_id = request_id;
+    active_tunnel_transaction = true;
+    memcpy(active_requester, requester, ESP_NOW_ETH_ALEN);
+    battery_transaction_active = true;
+
+    esp_err_t err = usb_host_transfer_submit(battery_input_transfer);
+
+    if (err != ESP_OK) {
+        battery_transaction_active = false;
+        active_read_deadline_us = 0;
+    }
 
     return err;
+}
+
+
+/*
+ * Preserved known-good diagnostic entry point. It is not triggered
+ * automatically; the tunnel supplies this same payload for testing.
+ */
+static esp_err_t wireless_pro_read_battery(void)
+{
+    return hid_set_report_transaction(
+        wireless_pro_battery_request,
+        sizeof(wireless_pro_battery_request),
+        NULL,
+        0,
+        false
+    );
 }
 
 
@@ -1461,8 +1652,57 @@ static void usb_client_event_cb(
 
 
 /* ============================================================
- * Inspect device and start battery request
+ * Inspect device and prepare the HID interface
  * ============================================================ */
+
+static bool find_rode_device_address(uint8_t *address_out)
+{
+    uint8_t addresses[8] = {0};
+    int address_count = 0;
+
+    if (
+        address_out == NULL ||
+        usb_host_device_addr_list_fill(
+            sizeof(addresses),
+            addresses,
+            &address_count
+        ) != ESP_OK
+    ) {
+        return false;
+    }
+
+    for (int index = 0; index < address_count; index++) {
+        usb_device_handle_t candidate = NULL;
+
+        if (
+            usb_host_device_open(
+                client_hdl,
+                addresses[index],
+                &candidate
+            ) != ESP_OK
+        ) {
+            continue;
+        }
+
+        const usb_device_desc_t *descriptor = NULL;
+        esp_err_t descriptor_err =
+            usb_host_get_device_descriptor(candidate, &descriptor);
+
+        bool is_rode =
+            descriptor_err == ESP_OK &&
+            descriptor != NULL &&
+            descriptor->idVendor == RODE_VID;
+
+        usb_host_device_close(client_hdl, candidate);
+
+        if (is_rode) {
+            *address_out = addresses[index];
+            return true;
+        }
+    }
+
+    return false;
+}
 
 static void inspect_usb_device(
     uint8_t address
@@ -1498,6 +1738,8 @@ static void inspect_usb_device(
         return;
     }
 
+    usb_connected = true;
+
 
     const usb_device_desc_t *dev_desc =
         NULL;
@@ -1513,7 +1755,6 @@ static void inspect_usb_device(
         err != ESP_OK ||
         dev_desc == NULL
     ) {
-
         screen_printf(
             "DESCRIPTOR ERROR\n\n"
             "%s",
@@ -1522,6 +1763,26 @@ static void inspect_usb_device(
 
         return;
     }
+
+    if (dev_desc->idVendor != RODE_VID) {
+        ESP_LOGI(
+            TAG,
+            "ignoring non-RODE USB device %04X:%04X at address %u",
+            dev_desc->idVendor,
+            dev_desc->idProduct,
+            address
+        );
+
+        usb_host_device_close(client_hdl, device_hdl);
+        device_hdl = NULL;
+        usb_connected = false;
+        connected_vid = 0;
+        connected_pid = 0;
+        return;
+    }
+
+    connected_vid = dev_desc->idVendor;
+    connected_pid = dev_desc->idProduct;
 
 
     usb_device_info_t info = {0};
@@ -1677,6 +1938,8 @@ static void inspect_usb_device(
     hid_in_mps =
         hid.in_mps;
 
+    hid_ready = true;
+
 
     screen_printf(
         "RODE USB DEVICE\n\n"
@@ -1686,7 +1949,7 @@ static void inspect_usb_device(
         "HID IF %d\n"
         "IN EP 0x%02X MPS %u\n\n"
         "Core: %d%% %.3fV\n\n"
-        "Reading battery...",
+        "HID ready",
         dev_desc->idVendor,
         dev_desc->idProduct,
         product,
@@ -1700,8 +1963,8 @@ static void inspect_usb_device(
 
 
     /*
-     * Only send our proprietary command to the exact product
-     * we have identified.
+     * Keep the known-good Wireless PRO battery request and parser above
+     * as diagnostic code, but do not trigger the request automatically.
      */
 
     if (
@@ -1710,26 +1973,28 @@ static void inspect_usb_device(
         dev_desc->idProduct ==
             WIRELESS_PRO_RX_PID
     ) {
+        char rssi_text[32];
 
-        vTaskDelay(
-            pdMS_TO_TICKS(200)
+        format_last_rssi(rssi_text, sizeof(rssi_text));
+
+        screen_printf(
+            "WIRELESS PRO READY\n\n"
+            "VID %04X PID %04X\n"
+            "%s\n"
+            "SN: %s\n\n"
+            "HID IF %d\n"
+            "IN EP 0x%02X MPS %u\n\n"
+            "%s\n\n"
+            "Waiting for tunnel test",
+            dev_desc->idVendor,
+            dev_desc->idProduct,
+            product,
+            serial,
+            hid.interface_number,
+            hid.in_endpoint,
+            hid.in_mps,
+            rssi_text
         );
-
-
-        err =
-            wireless_pro_read_battery();
-
-
-        if (err != ESP_OK) {
-
-            screen_printf(
-                "WIRELESS PRO\n\n"
-                "Battery request\n"
-                "could not start\n\n"
-                "%s",
-                esp_err_to_name(err)
-            );
-        }
     }
     else {
 
@@ -1754,6 +2019,20 @@ static void inspect_usb_device(
 void app_main(void)
 {
     esp_err_t err;
+
+    esp_err_t ota_valid_err =
+        esp_ota_mark_app_valid_cancel_rollback();
+
+    if (
+        ota_valid_err != ESP_OK &&
+        ota_valid_err != ESP_ERR_NOT_SUPPORTED
+    ) {
+        ESP_LOGW(
+            TAG,
+            "OTA validity confirmation: %s",
+            esp_err_to_name(ota_valid_err)
+        );
+    }
 
 
     /* --------------------------------------------------------
@@ -1794,76 +2073,71 @@ void app_main(void)
 
 
     /* ========================================================
-     * CHARGE MODE
+     * POWER MODE SELECTION
      * ======================================================== */
+
+    bool grove_host_mode = false;
+    bool espnow_started = false;
 
     if (power.vbus_present) {
 
         cores3_usb_power(false);
+        err = espnow_transport_start();
+        if (err != ESP_OK) {
+            fatal_error("ESP-NOW maintenance", err);
+        }
+        espnow_started = true;
+        show_grove_host_button();
 
+        while (!grove_host_selected) {
 
-        while (1) {
-
-            err =
-                read_core_power(
-                    &power
-                );
-
+            err = read_core_power(&power);
 
             if (err != ESP_OK) {
-
                 screen_printf(
                     "DAMspy M5 Control\n\n"
-                    "CHARGE MODE\n\n"
+                    "POWER MODE\n\n"
                     "Power read error"
                 );
-
-                vTaskDelay(
-                    pdMS_TO_TICKS(2000)
-                );
-
-                continue;
             }
-
-
-            if (power.vbus_present) {
-
+            else if (power.vbus_present) {
                 screen_printf(
                     "DAMspy M5 Control\n\n"
-                    "CHARGE MODE\n\n"
-                    "External VBUS: YES\n\n"
-                    "Core battery: %d%%\n"
-                    "Battery: %.3f V\n\n"
+                    "EXTERNAL POWER\n\n"
+                    "Core: %d%% %.3fV\n"
                     "%s\n\n"
-                    "Unplug + RESET\n"
-                    "for HOST mode",
+                    "PC USB: leave in charge mode\n"
+                    "Grove: tap button for host",
                     power.battery_percent,
                     power.battery_voltage,
-                    power.charging
-                        ? "CHARGING"
-                        : "Powered / standby"
+                    power.charging ? "CHARGING" : "Powered / standby"
                 );
             }
             else {
-
                 screen_printf(
                     "DAMspy M5 Control\n\n"
-                    "CHARGE MODE\n\n"
-                    "External VBUS removed\n\n"
-                    "Core battery: %d%%\n"
-                    "Battery: %.3f V\n\n"
-                    "Press RESET\n"
-                    "for HOST mode",
-                    power.battery_percent,
-                    power.battery_voltage
+                    "External power removed\n\n"
+                    "Reset for battery host mode"
                 );
             }
 
-
-            vTaskDelay(
-                pdMS_TO_TICKS(2000)
-            );
+            espnow_hid_message_t maintenance_request;
+            if (espnow_transport_receive_message(&maintenance_request, 0)) {
+                (void)core_ota_handle_message(&maintenance_request, false);
+            }
+            core_ota_poll();
+            vTaskDelay(pdMS_TO_TICKS(25));
         }
+
+        err = read_core_power(&power);
+        if (err != ESP_OK || !power.vbus_present) {
+            grove_host_selected = false;
+            remove_grove_host_button();
+            fatal_error("Grove power removed", ESP_ERR_INVALID_STATE);
+        }
+
+        remove_grove_host_button();
+        grove_host_mode = true;
     }
 
 
@@ -1871,37 +2145,90 @@ void app_main(void)
      * HOST MODE
      * ======================================================== */
 
-    for (int i = 5; i > 0; i--) {
+    if (grove_host_mode) {
+        screen_printf(
+            "DAMspy M5 Control\n\n"
+            "GROVE HOST MODE\n\n"
+            "External 5V: YES\n"
+            "Core: %d%% %.3fV\n\n"
+            "Preparing USB host...",
+            power.battery_percent,
+            power.battery_voltage
+        );
+    }
+    else {
+        /*
+         * Enter a known-safe transition state before the countdown:
+         * neither Grove/bus output nor USB-C host VBUS is driven.
+         */
+        cores3_usb_power(false);
+
+        for (int i = 5; i > 0; i--) {
+            screen_printf(
+                "DAMspy M5 Control\n\n"
+                "BATTERY HOST MODE\n\n"
+                "Core: %d%% %.3fV\n\n"
+                "Disconnect PC USB NOW\n"
+                "Keep Grove disconnected\n\n"
+                "USB host in %d...",
+                power.battery_percent,
+                power.battery_voltage,
+                i
+            );
+
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
 
         screen_printf(
             "DAMspy M5 Control\n\n"
-            "HOST MODE\n\n"
-            "Core battery: %d%%\n"
-            "Battery: %.3f V\n\n"
-            "USB host in %d...",
+            "BATTERY HOST MODE\n\n"
+            "Core: %d%% %.3fV\n\n"
+            "Enabling DUT VBUS...",
             power.battery_percent,
-            power.battery_voltage,
-            i
+            power.battery_voltage
         );
 
-
-        vTaskDelay(
-            pdMS_TO_TICKS(1000)
-        );
+        cores3_usb_power(true);
     }
 
 
-    screen_printf(
-        "DAMspy M5 Control\n\n"
-        "HOST MODE\n\n"
-        "Core: %d%% %.3fV\n\n"
-        "Enabling DUT VBUS...",
-        power.battery_percent,
-        power.battery_voltage
+    /* --------------------------------------------------------
+     * ESP-NOW opaque HID transport
+     * -------------------------------------------------------- */
+
+    hid_response_queue = xQueueCreate(
+        2,
+        sizeof(hid_response_t)
     );
 
+    if (hid_response_queue == NULL) {
+        fatal_error("HID response queue", ESP_ERR_NO_MEM);
+    }
 
-    cores3_usb_power(true);
+    if (!espnow_started) {
+        err = espnow_transport_start();
+
+        if (err != ESP_OK) {
+            fatal_error(
+                "ESP-NOW transport",
+                err
+            );
+        }
+        espnow_started = true;
+    }
+
+    if (
+        xTaskCreate(
+            telemetry_task,
+            "telemetry",
+            3072,
+            NULL,
+            4,
+            NULL
+        ) != pdPASS
+    ) {
+        fatal_error("telemetry task", ESP_ERR_NO_MEM);
+    }
 
 
     /* --------------------------------------------------------
@@ -1981,14 +2308,27 @@ void app_main(void)
         }
     }
 
+    if (grove_host_mode) {
+        screen_printf(
+            "DAMspy M5 Control\n\n"
+            "GROVE HOST MODE\n\n"
+            "USB host ready\n\n"
+            "Enabling DUT VBUS..."
+        );
+
+        cores3_grove_host_power();
+    }
+
 
     screen_printf(
         "DAMspy M5 Control\n\n"
         "USB HOST READY\n\n"
         "Core: %d%% %.3fV\n\n"
-        "Waiting for RODE...",
+        "Waiting for RODE...\n\n"
+        "%s",
         power.battery_percent,
-        power.battery_voltage
+        power.battery_voltage,
+        grove_host_mode ? "Powered from Grove" : "Keep Grove disconnected"
     );
 
 
@@ -1996,12 +2336,22 @@ void app_main(void)
      * Event loop
      * -------------------------------------------------------- */
 
+    int64_t next_usb_scan_us = 0;
+    int64_t cold_attach_recovery_deadline_us =
+        esp_timer_get_time() + 8000000;
+    bool cold_attach_recovery_done = false;
+
     while (1) {
+
+        TickType_t event_wait =
+            active_read_deadline_us > 0
+            ? pdMS_TO_TICKS(10)
+            : pdMS_TO_TICKS(100);
 
         err =
             usb_host_client_handle_events(
                 client_hdl,
-                pdMS_TO_TICKS(100)
+                event_wait
             );
 
 
@@ -2018,23 +2368,393 @@ void app_main(void)
         }
 
 
+        if (
+            battery_transaction_active &&
+            active_write_deadline_us > 0 &&
+            esp_timer_get_time() >= active_write_deadline_us
+        ) {
+            uint8_t timeout_body[HID_TUNNEL_WRITE_RESPONSE_SIZE] = {
+                HID_TUNNEL_RESULT_USB_ERROR,
+                0,
+                0
+            };
+
+            active_write_deadline_us = 0;
+
+            if (active_tunnel_transaction) {
+                esp_err_t send_err = espnow_transport_send_message(
+                    active_requester,
+                    HID_TUNNEL_WRITE_RESPONSE,
+                    active_request_id,
+                    timeout_body,
+                    sizeof(timeout_body)
+                );
+
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "WRITE timeout response: %s",
+                        esp_err_to_name(send_err)
+                    );
+                }
+            }
+
+            /* Suppress a duplicate tunnel response from the cancellation
+             * callback while the root-port restart discards endpoint zero. */
+            active_tunnel_transaction = false;
+            usb_connected = false;
+            hid_ready = false;
+
+            ESP_LOGW(TAG, "SET_REPORT timed out; restarting USB root port");
+            esp_err_t root_off_err =
+                usb_host_lib_set_root_port_power(false);
+            vTaskDelay(pdMS_TO_TICKS(250));
+            esp_err_t root_on_err =
+                usb_host_lib_set_root_port_power(true);
+
+            if (
+                root_off_err != ESP_OK ||
+                root_on_err != ESP_OK
+            ) {
+                ESP_LOGE(
+                    TAG,
+                    "WRITE USB recovery: off=%s on=%s",
+                    esp_err_to_name(root_off_err),
+                    esp_err_to_name(root_on_err)
+                );
+            }
+        }
+
+
+        if (
+            battery_transaction_active &&
+            active_read_deadline_us > 0 &&
+            !read_timeout_cancel_pending &&
+            esp_timer_get_time() >= active_read_deadline_us
+        ) {
+            read_timeout_cancel_pending = true;
+
+            esp_err_t halt_err = usb_host_endpoint_halt(
+                device_hdl,
+                hid_in_endpoint
+            );
+
+            if (halt_err == ESP_OK) {
+                read_endpoint_needs_clear = true;
+
+                esp_err_t flush_err = usb_host_endpoint_flush(
+                    device_hdl,
+                    hid_in_endpoint
+                );
+
+                if (flush_err != ESP_OK) {
+                    ESP_LOGW(
+                        TAG,
+                        "READ timeout flush: %s",
+                        esp_err_to_name(flush_err)
+                    );
+                }
+            }
+            else {
+                read_timeout_cancel_pending = false;
+                ESP_LOGW(
+                    TAG,
+                    "READ timeout halt: %s",
+                    esp_err_to_name(halt_err)
+                );
+            }
+        }
+
+
+        hid_response_t hid_response;
+
+        while (
+            xQueueReceive(
+                hid_response_queue,
+                &hid_response,
+                0
+            ) == pdTRUE
+        ) {
+            if (
+                hid_response.operation == HID_TUNNEL_READ_RESPONSE &&
+                read_endpoint_needs_clear
+            ) {
+                esp_err_t clear_err = usb_host_endpoint_clear(
+                    device_hdl,
+                    hid_in_endpoint
+                );
+
+                if (clear_err != ESP_OK) {
+                    hid_response.result = HID_TUNNEL_RESULT_USB_ERROR;
+                    hid_response.length = 0;
+                    hid_ready = false;
+
+                    ESP_LOGE(
+                        TAG,
+                        "READ timeout clear: %s",
+                        esp_err_to_name(clear_err)
+                    );
+                }
+
+                read_endpoint_needs_clear = false;
+                read_timeout_cancel_pending = false;
+                battery_transaction_active = false;
+            }
+
+            if (hid_response.tunnel_transaction) {
+                uint8_t body[HID_TUNNEL_MAX_BODY];
+                size_t body_length = 0;
+
+                body[0] = hid_response.result;
+                hid_tunnel_put_u16(&body[1], hid_response.length);
+                body_length = HID_TUNNEL_READ_RESPONSE_OVERHEAD;
+
+                if (
+                    hid_response.operation == HID_TUNNEL_READ_RESPONSE &&
+                    hid_response.result == HID_TUNNEL_RESULT_OK
+                ) {
+                    memcpy(
+                        &body[HID_TUNNEL_READ_RESPONSE_OVERHEAD],
+                        hid_response.data,
+                        hid_response.length
+                    );
+                    body_length += hid_response.length;
+
+                    if (
+                        hid_response.length >= 3 &&
+                        hid_response.data[0] == BATTERY_RESPONSE_REPORT_ID &&
+                        hid_response.data[1] == BATTERY_COMMAND &&
+                        hid_response.data[2] == 0x41
+                    ) {
+                        show_battery_response(
+                            hid_response.data,
+                            hid_response.length
+                        );
+                    }
+                }
+
+                esp_err_t send_err = espnow_transport_send_message(
+                    hid_response.destination,
+                    hid_response.operation,
+                    hid_response.request_id,
+                    body,
+                    body_length
+                );
+
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "ESP-NOW response: %s",
+                        esp_err_to_name(send_err)
+                    );
+                }
+            }
+        }
+
+
+        core_ota_poll();
+        espnow_hid_message_t request;
+
+        if (espnow_transport_receive_message(&request, 0)) {
+            if (core_ota_handle_message(&request, battery_transaction_active)) {
+                continue;
+            }
+
+            uint8_t result = HID_TUNNEL_RESULT_OK;
+            uint8_t response_type = 0;
+            uint8_t response_body[HID_TUNNEL_STATUS_RESPONSE_SIZE] = {0};
+            size_t response_length = 0;
+            bool send_immediate_response = false;
+
+            if (request.type == HID_TUNNEL_WRITE_REQUEST) {
+                response_type = HID_TUNNEL_WRITE_RESPONSE;
+            }
+            else if (request.type == HID_TUNNEL_READ_REQUEST) {
+                response_type = HID_TUNNEL_READ_RESPONSE;
+            }
+
+            if (request.type == HID_TUNNEL_STATUS_REQUEST) {
+                response_type = HID_TUNNEL_STATUS_RESPONSE;
+                response_body[0] = usb_connected;
+                response_body[1] = hid_ready;
+                hid_tunnel_put_u16(&response_body[2], connected_vid);
+                hid_tunnel_put_u16(&response_body[4], connected_pid);
+                response_length = HID_TUNNEL_STATUS_RESPONSE_SIZE;
+                send_immediate_response = true;
+            }
+            else if (battery_transaction_active) {
+                result = HID_TUNNEL_RESULT_BUSY;
+            }
+            else if (!usb_connected || !hid_ready) {
+                result = HID_TUNNEL_RESULT_NO_DEVICE;
+            }
+            else if (request.type == HID_TUNNEL_WRITE_REQUEST) {
+                if (
+                    request.body_length == 0 ||
+                    request.body_length > HID_TUNNEL_MAX_HID_BYTES
+                ) {
+                    result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+                }
+                else {
+                    esp_err_t hid_err = hid_set_report_transaction(
+                        request.body,
+                        request.body_length,
+                        request.source,
+                        request.request_id,
+                        true
+                    );
+
+                    if (hid_err == ESP_OK) {
+                        continue;
+                    }
+
+                    result = HID_TUNNEL_RESULT_USB_ERROR;
+                }
+            }
+            else if (request.type == HID_TUNNEL_READ_REQUEST) {
+                if (request.body_length != HID_TUNNEL_READ_REQUEST_SIZE) {
+                    result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+                }
+                else {
+                    uint16_t requested_length =
+                        hid_tunnel_get_u16(request.body);
+                    uint32_t timeout_ms =
+                        hid_tunnel_get_u32(&request.body[2]);
+
+                    if (
+                        requested_length == 0 ||
+                        requested_length > HID_TUNNEL_MAX_HID_BYTES ||
+                        timeout_ms == 0
+                    ) {
+                        result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+                    }
+                    else {
+                        esp_err_t hid_err = hid_interrupt_read(
+                            requested_length,
+                            timeout_ms,
+                            request.source,
+                            request.request_id
+                        );
+
+                        if (hid_err == ESP_OK) {
+                            ESP_LOGI(
+                                TAG,
+                                "READ %u bytes, timeout %lu ms",
+                                requested_length,
+                                (unsigned long)active_read_timeout_ms
+                            );
+                            continue;
+                        }
+
+                        result = HID_TUNNEL_RESULT_USB_ERROR;
+                    }
+                }
+            }
+            else {
+                result = HID_TUNNEL_RESULT_INVALID_REQUEST;
+            }
+
+            if (!send_immediate_response) {
+                response_body[0] = result;
+                hid_tunnel_put_u16(&response_body[1], 0);
+                response_length = HID_TUNNEL_READ_RESPONSE_OVERHEAD;
+                send_immediate_response = response_type != 0;
+            }
+
+            if (send_immediate_response) {
+                esp_err_t send_err = espnow_transport_send_message(
+                    request.source,
+                    response_type,
+                    request.request_id,
+                    response_body,
+                    response_length
+                );
+
+                if (send_err != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "ESP-NOW operation response: %s",
+                        esp_err_to_name(send_err)
+                    );
+                }
+            }
+        }
+
+
         /*
          * New USB device
          */
 
         if (
-            pending_device_address >= 0 &&
-            device_hdl == NULL
+            device_hdl == NULL &&
+            (
+                pending_device_address >= 0 ||
+                esp_timer_get_time() >= next_usb_scan_us
+            )
         ) {
+            pending_device_address = -1;
+            next_usb_scan_us =
+                esp_timer_get_time() + 500000;
 
-            int address =
-                pending_device_address;
+            uint8_t rode_address = 0;
+
+            if (
+                find_rode_device_address(&rode_address)
+            ) {
+                inspect_usb_device(rode_address);
+            }
+        }
+
+
+        /*
+         * Some composite RODE products expose an external hub before their
+         * HID function. If that hub is already present during host startup,
+         * its first downstream enumeration can stall. Recreate one physical
+         * unplug/replug after a generous startup grace period. Never disturb
+         * a device which has successfully reached the RODE discovery path.
+         */
+        if (
+            grove_host_mode &&
+            !cold_attach_recovery_done &&
+            device_hdl == NULL &&
+            esp_timer_get_time() >= cold_attach_recovery_deadline_us
+        ) {
+            cold_attach_recovery_done = true;
+
+            screen_printf(
+                "DAMspy M5 Control\n\n"
+                "USB HOST RECOVERY\n\n"
+                "Cycling DUT power..."
+            );
+
+            esp_err_t root_off_err =
+                usb_host_lib_set_root_port_power(false);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_err_t root_on_err =
+                usb_host_lib_set_root_port_power(true);
+
+            if (
+                root_off_err != ESP_OK ||
+                root_on_err != ESP_OK
+            ) {
+                ESP_LOGE(
+                    TAG,
+                    "USB root recovery: off=%s on=%s",
+                    esp_err_to_name(root_off_err),
+                    esp_err_to_name(root_on_err)
+                );
+            }
 
             pending_device_address = -1;
+            next_usb_scan_us =
+                esp_timer_get_time() + 500000;
 
-
-            inspect_usb_device(
-                (uint8_t)address
+            screen_printf(
+                "DAMspy M5 Control\n\n"
+                "USB HOST READY\n\n"
+                "Recovery complete\n\n"
+                "Waiting for RODE...\n\n"
+                "Powered from Grove"
             );
         }
 
@@ -2050,6 +2770,15 @@ void app_main(void)
 
             device_gone = false;
             battery_transaction_active = false;
+            active_write_deadline_us = 0;
+            active_read_deadline_us = 0;
+            read_timeout_cancel_pending = false;
+            read_endpoint_needs_clear = false;
+            xQueueReset(hid_response_queue);
+            usb_connected = false;
+            hid_ready = false;
+            connected_vid = 0;
+            connected_pid = 0;
 
 
             if (
@@ -2088,9 +2817,11 @@ void app_main(void)
                 "USB HOST READY\n\n"
                 "Device removed\n\n"
                 "Core: %d%% %.3fV\n\n"
-                "Waiting for RODE...",
+                "Waiting for RODE...\n\n"
+                "%s",
                 power.battery_percent,
-                power.battery_voltage
+                power.battery_voltage,
+                grove_host_mode ? "Powered from Grove" : "Keep Grove disconnected"
             );
         }
     }

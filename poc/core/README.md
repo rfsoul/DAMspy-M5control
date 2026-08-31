@@ -51,3 +51,23 @@ Please use the following feedback channels:
 * For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
 
 We will get back to you as soon as possible.
+
+## ESP-NOW application OTA (POC)
+
+Core uses `partitions.csv` with two 3.75 MiB OTA application slots. The first
+installation must be a complete USB flash so the bootloader, partition table,
+OTA data, and initial application are installed. Subsequent Core application
+images can be sent through a USB-connected StickS3:
+
+```sh
+python tools/espnow_ota.py --port /dev/serial/by-id/<StickS3> \\
+  --expect-version <version> poc/core/build/hello_world.bin
+```
+
+The uploader sends acknowledged 238-byte chunks, retries lost responses, resumes
+an interrupted host process from the Core's reported offset, verifies SHA-256,
+and waits for the Core to reboot and report its application version. Core keeps
+the current slot selected until the complete new ESP image passes validation.
+
+This maintenance protocol is currently an unencrypted POC on the same ESP-NOW
+channel as HID transport. Do not treat it as authenticated production OTA.
