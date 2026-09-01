@@ -3,6 +3,7 @@ idf_component_register(
         "hello_world_main.c"
         "espnow_echo.c"
         "core_ota.c"
+        "core_usb_proxy.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         usb
@@ -13,4 +14,5 @@ idf_component_register(
         app_update
         mbedtls
         hid_tunnel_protocol
+        esp_driver_usb_serial_jtag
 )

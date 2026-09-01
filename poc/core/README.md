@@ -71,3 +71,28 @@ the current slot selected until the complete new ESP image passes validation.
 
 This maintenance protocol is currently an unencrypted POC on the same ESP-NOW
 channel as HID transport. Do not treat it as authenticated production OTA.
+
+## Remote diagnostics and recovery
+
+With a StickS3 Gateway attached to the Pi, query both devices without relying on
+their displays:
+
+```sh
+python tools/m5_recovery.py status --port /dev/ttyACM1
+```
+
+The command records a JSON-lines snapshot under
+`~/.local/state/damspy/m5-recovery.jsonl`. Recovery commands always attempt and
+save a pre-reset snapshot before resetting:
+
+```sh
+python tools/m5_recovery.py reset-node --port /dev/ttyACM1
+python tools/m5_recovery.py reset-gateway --port /dev/ttyACM1
+python tools/m5_recovery.py hard-reset-gateway --port /dev/ttyACM1
+```
+
+Node diagnostic and reset messages bypass HID BUSY handling. The Node retains
+its last state, operation, result, request ID, and BUSY duration in RTC memory
+across a software reset, so post-reset status still contains the failure
+context. The hard Gateway reset uses the USB serial reset line when its serial
+command loop cannot respond.

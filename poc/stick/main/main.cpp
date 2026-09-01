@@ -15,6 +15,8 @@
 #include "esp_now.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
@@ -47,6 +49,7 @@
 #define SURVEY_SET_RESPONSE    0x02
 #define SURVEY_INTERVAL_MS     1000
 #define SURVEY_RESPONSE_MS     800
+#define DISCOVERY_DWELL_MS     350
 
 
 typedef struct {
@@ -69,6 +72,33 @@ static const uint8_t test_frame[] = {
 
 static QueueHandle_t receive_queue = NULL;
 static M5GFX display;
+static portMUX_TYPE gateway_diag_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool gateway_rx_valid = false;
+static int8_t gateway_last_rssi = 0;
+static int64_t gateway_last_rx_us = 0;
+static const char *TAG = "stick_espnow";
+static bool gateway_tx_valid = false;
+static esp_now_send_status_t gateway_tx_status = ESP_NOW_SEND_FAIL;
+static uint16_t gateway_tx_count = 0;
+
+
+static void espnow_send_callback(
+    const esp_now_send_info_t *info,
+    esp_now_send_status_t status)
+{
+    taskENTER_CRITICAL(&gateway_diag_lock);
+    gateway_tx_valid = true;
+    gateway_tx_status = status;
+    gateway_tx_count++;
+    taskEXIT_CRITICAL(&gateway_diag_lock);
+    if (info == NULL) {
+        ESP_LOGW(TAG, "TX callback without metadata status=%d", status);
+        return;
+    }
+    ESP_LOGI(TAG, "TX dst=" MACSTR " status=%s",
+        MAC2STR(info->des_addr),
+        status == ESP_NOW_SEND_SUCCESS ? "ok" : "fail");
+}
 
 
 static void show_starting(void)
@@ -332,6 +362,20 @@ static void espnow_receive_callback(
 
     received_frame_t frame = {};
 
+    if (info->rx_ctrl != NULL) {
+        taskENTER_CRITICAL(&gateway_diag_lock);
+        gateway_last_rssi = info->rx_ctrl->rssi;
+        gateway_last_rx_us = esp_timer_get_time();
+        gateway_rx_valid = true;
+        taskEXIT_CRITICAL(&gateway_diag_lock);
+    }
+
+
+    ESP_LOGI(TAG, "RX src=" MACSTR " len=%d rssi=%d first=%02x",
+        MAC2STR(info->src_addr), data_length,
+        info->rx_ctrl != NULL ? info->rx_ctrl->rssi : 0,
+        data[0]);
+
     frame.length = data_length;
 
     memcpy(
@@ -437,6 +481,12 @@ static esp_err_t initialise_espnow(void)
     err = esp_now_register_recv_cb(
         espnow_receive_callback
     );
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_now_register_send_cb(espnow_send_callback);
 
     if (err != ESP_OK) {
         return err;
@@ -622,6 +672,8 @@ static bool valid_serial_request(
                 hid_tunnel_get_u32(&message->body[2]) > 0;
 
         case HID_TUNNEL_STATUS_REQUEST:
+        case HID_TUNNEL_NODE_DIAG_REQUEST:
+        case HID_TUNNEL_NODE_RESET_REQUEST:
             return message->body_length == 0;
 
         default:
@@ -843,6 +895,117 @@ static bool send_survey_arm_response(uint32_t request_id)
 }
 
 
+static size_t build_gateway_diagnostic(
+    uint8_t *body, size_t capacity, uint8_t state,
+    uint8_t last_type, uint8_t last_result, uint32_t last_request_id,
+    int64_t state_since_us)
+{
+    const esp_app_desc_t *description = esp_app_get_description();
+    size_t version_length = strnlen(
+        description->version, HID_TUNNEL_DIAG_VERSION_MAX);
+    if (capacity < HID_TUNNEL_DIAG_FIXED_SIZE + version_length) return 0;
+
+    taskENTER_CRITICAL(&gateway_diag_lock);
+    bool rx_valid = gateway_rx_valid;
+    int8_t rssi = gateway_last_rssi;
+    int64_t rx_us = gateway_last_rx_us;
+    taskEXIT_CRITICAL(&gateway_diag_lock);
+    uint32_t rx_age = rx_valid
+        ? (uint32_t)((esp_timer_get_time() - rx_us) / 1000000) : 0;
+
+    body[0] = HID_TUNNEL_DIAG_VERSION;
+    body[1] = rx_valid ? HID_TUNNEL_DIAG_FLAG_RX_VALID : 0;
+    body[2] = state;
+    body[3] = last_type;
+    body[4] = last_result;
+    body[5] = (uint8_t)esp_reset_reason();
+    taskENTER_CRITICAL(&gateway_diag_lock);
+    body[6] = gateway_tx_valid ? 1 : 0;
+    body[7] = (uint8_t)gateway_tx_status;
+    hid_tunnel_put_u16(&body[8], gateway_tx_count);
+    taskEXIT_CRITICAL(&gateway_diag_lock);
+    hid_tunnel_put_u32(&body[10], last_request_id);
+    hid_tunnel_put_u32(&body[14], (uint32_t)(esp_timer_get_time() / 1000));
+    hid_tunnel_put_u16(&body[18], 0);
+    hid_tunnel_put_u16(&body[20], 0);
+    body[22] = (uint8_t)rssi;
+    body[23] = rx_age > 255 ? 255 : (uint8_t)rx_age;
+    hid_tunnel_put_u32(&body[24],
+        (state == HID_TUNNEL_STATE_WAITING || state == HID_TUNNEL_STATE_OTA) &&
+        state_since_us > 0
+            ? (uint32_t)((esp_timer_get_time() - state_since_us) / 1000)
+            : 0);
+    uint8_t station_mac[ESP_NOW_ETH_ALEN] = {};
+    (void)esp_wifi_get_mac(WIFI_IF_STA, station_mac);
+    memcpy(&body[28], station_mac, ESP_NOW_ETH_ALEN);
+    body[34] = 0;
+    body[35] = 0;
+    body[36] = (uint8_t)version_length;
+    memcpy(&body[HID_TUNNEL_DIAG_FIXED_SIZE], description->version, version_length);
+    return HID_TUNNEL_DIAG_FIXED_SIZE + version_length;
+}
+
+
+static esp_err_t configure_broadcast_radio(uint8_t channel, bool long_range)
+{
+    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) return err;
+
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, broadcast_address, ESP_NOW_ETH_ALEN);
+    peer.ifidx = WIFI_IF_STA;
+    peer.channel = channel;
+    peer.encrypt = false;
+    err = esp_now_mod_peer(&peer);
+    if (err != ESP_OK) return err;
+
+    esp_now_rate_config_t rate_config = {
+        .phymode = long_range ? WIFI_PHY_MODE_LR : WIFI_PHY_MODE_11B,
+        .rate = long_range ? WIFI_PHY_RATE_LORA_250K : WIFI_PHY_RATE_1M_L,
+        .ersu = false,
+        .dcm = false
+    };
+    return esp_now_set_peer_rate_config(broadcast_address, &rate_config);
+}
+
+
+static bool discover_node(uint32_t request_id, uint8_t result[8])
+{
+    uint8_t request[HID_TUNNEL_HEADER_SIZE];
+    size_t request_length = hid_tunnel_encode(
+        request, sizeof(request), HID_TUNNEL_STATUS_REQUEST,
+        request_id, NULL, 0);
+
+    for (uint8_t channel = 1; channel <= 13; channel++) {
+        for (int mode = 0; mode < 2; mode++) {
+            bool long_range = mode == 0;
+            xQueueReset(receive_queue);
+            if (configure_broadcast_radio(channel, long_range) != ESP_OK) continue;
+            if (esp_now_send(broadcast_address, request, request_length) != ESP_OK) continue;
+
+            received_frame_t received = {};
+            if (xQueueReceive(
+                    receive_queue, &received,
+                    pdMS_TO_TICKS(DISCOVERY_DWELL_MS)) != pdTRUE) continue;
+
+            hid_tunnel_message_t response = {};
+            if (!hid_tunnel_decode(received.data, received.length, &response) ||
+                response.type != HID_TUNNEL_STATUS_RESPONSE ||
+                response.request_id != request_id) continue;
+
+            result[0] = channel;
+            result[1] = long_range ? 1 : 0;
+            memcpy(&result[2], received.source, ESP_NOW_ETH_ALEN);
+            (void)configure_broadcast_radio(ESPNOW_CHANNEL, true);
+            return true;
+        }
+    }
+
+    (void)configure_broadcast_radio(ESPNOW_CHANNEL, true);
+    return false;
+}
+
+
 static void show_survey(
     uint32_t sent,
     uint32_t received,
@@ -1021,6 +1184,11 @@ static void run_bridge(void)
     uint32_t forwarded = 0;
     uint32_t returned = 0;
     uint32_t rejected = 0;
+    uint8_t diagnostic_state = HID_TUNNEL_STATE_READY;
+    uint8_t diagnostic_last_type = 0;
+    uint8_t diagnostic_last_result = HID_TUNNEL_RESULT_OK;
+    uint32_t diagnostic_last_request_id = 0;
+    int64_t diagnostic_state_since_us = esp_timer_get_time();
     show_bridge(0, 0, 0, 0, 0, "READY", false);
 
     while (1) {
@@ -1034,6 +1202,60 @@ static void run_bridge(void)
                 0, 0, "BAD SERIAL FRAME", true
             );
             continue;
+        }
+
+        hid_tunnel_message_t local_request = {};
+        if (
+            hid_tunnel_decode(inner, inner_length, &local_request) &&
+            local_request.body_length == 0 &&
+            (local_request.type == HID_TUNNEL_GATEWAY_DIAG_REQUEST ||
+             local_request.type == HID_TUNNEL_GATEWAY_RESET_REQUEST ||
+             local_request.type == HID_TUNNEL_GATEWAY_SCAN_REQUEST)
+        ) {
+            diagnostic_last_type = local_request.type;
+            diagnostic_last_request_id = local_request.request_id;
+            diagnostic_last_result = HID_TUNNEL_RESULT_OK;
+
+            if (local_request.type == HID_TUNNEL_GATEWAY_DIAG_REQUEST) {
+                uint8_t body[HID_TUNNEL_DIAG_FIXED_SIZE + HID_TUNNEL_DIAG_VERSION_MAX];
+                size_t length = build_gateway_diagnostic(
+                    body, sizeof(body), diagnostic_state,
+                    diagnostic_last_type, diagnostic_last_result,
+                    diagnostic_last_request_id, diagnostic_state_since_us);
+                uint8_t response[HID_TUNNEL_HEADER_SIZE + sizeof(body)];
+                size_t response_length = hid_tunnel_encode(
+                    response, sizeof(response), HID_TUNNEL_GATEWAY_DIAG_RESPONSE,
+                    local_request.request_id, body, length);
+                (void)serial_send_inner(response, response_length);
+                continue;
+            }
+
+            if (local_request.type == HID_TUNNEL_GATEWAY_SCAN_REQUEST) {
+                uint8_t body[9] = {HID_TUNNEL_RESULT_TIMEOUT};
+                if (discover_node(local_request.request_id, &body[1])) {
+                    body[0] = HID_TUNNEL_RESULT_OK;
+                }
+                uint8_t response[HID_TUNNEL_HEADER_SIZE + sizeof(body)];
+                size_t response_length = hid_tunnel_encode(
+                    response, sizeof(response), HID_TUNNEL_GATEWAY_SCAN_RESPONSE,
+                    local_request.request_id, body, sizeof(body));
+                (void)serial_send_inner(response, response_length);
+                continue;
+            }
+
+            uint8_t result = HID_TUNNEL_RESULT_OK;
+            uint8_t response[HID_TUNNEL_HEADER_SIZE + 1];
+            size_t response_length = hid_tunnel_encode(
+                response, sizeof(response), HID_TUNNEL_GATEWAY_RESET_RESPONSE,
+                local_request.request_id, &result, 1);
+            diagnostic_state = HID_TUNNEL_STATE_RESETTING;
+            diagnostic_state_since_us = esp_timer_get_time();
+            (void)serial_send_inner(response, response_length);
+            show_bridge(forwarded, returned, rejected,
+                local_request.type, local_request.request_id,
+                "RESETTING", false);
+            vTaskDelay(pdMS_TO_TICKS(250));
+            esp_restart();
         }
 
         uint32_t survey_request_id = 0;
@@ -1079,8 +1301,11 @@ static void run_bridge(void)
 
         uint8_t request_type = is_ota ? ota_request.type : hid_request.type;
         uint32_t request_id = is_ota ? ota_request.request_id : hid_request.request_id;
+        diagnostic_last_type = request_type;
+        diagnostic_last_request_id = request_id;
+        diagnostic_last_result = HID_TUNNEL_RESULT_OK;
         uint32_t operation_timeout_ms = is_ota
-            ? (request_type == ESPNOW_OTA_BEGIN_REQUEST ? 30000 : 10000)
+            ? (request_type == ESPNOW_OTA_BEGIN_REQUEST ? 30000 : 4000)
             : response_timeout_ms(&hid_request);
 
         xQueueReset(receive_queue);
@@ -1094,6 +1319,9 @@ static void run_bridge(void)
         }
 
         forwarded++;
+        diagnostic_state = is_ota
+            ? HID_TUNNEL_STATE_OTA : HID_TUNNEL_STATE_WAITING;
+        diagnostic_state_since_us = esp_timer_get_time();
         show_bridge(forwarded, returned, rejected, request_type, request_id,
             is_ota ? "OTA WAITING" : "WAITING", false);
 
@@ -1144,6 +1372,8 @@ static void run_bridge(void)
                 )
             ) {
                 returned++;
+                diagnostic_state = HID_TUNNEL_STATE_READY;
+                diagnostic_state_since_us = esp_timer_get_time();
                 show_bridge(
                     forwarded, returned, rejected,
                     request_type, request_id,
@@ -1164,6 +1394,9 @@ static void run_bridge(void)
 
         if (!matched) {
             rejected++;
+            diagnostic_state = HID_TUNNEL_STATE_ERROR;
+            diagnostic_state_since_us = esp_timer_get_time();
+            diagnostic_last_result = HID_TUNNEL_RESULT_TIMEOUT;
             show_bridge(
                 forwarded, returned, rejected,
                 request_type, request_id,

@@ -13,6 +13,9 @@
 #include "esp_intr_alloc.h"
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
+#include "esp_app_desc.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 
 #include "driver/i2c_master.h"
 
@@ -26,6 +29,7 @@
 
 #include "espnow_echo.h"
 #include "core_ota.h"
+#include "core_usb_proxy.h"
 #include "espnow_ota_protocol.h"
 
 
@@ -143,6 +147,123 @@ static bool usb_connected = false;
 static bool hid_ready = false;
 static uint16_t connected_vid = 0;
 static uint16_t connected_pid = 0;
+static uint8_t diagnostic_state = HID_TUNNEL_STATE_BOOTING;
+static uint8_t diagnostic_last_type = 0;
+static uint8_t diagnostic_last_result = HID_TUNNEL_RESULT_OK;
+static uint32_t diagnostic_last_request_id = 0;
+static int64_t diagnostic_busy_since_us = 0;
+
+#define CORE_DIAG_RTC_MAGIC 0x43444731u
+
+typedef struct {
+    uint32_t magic;
+    uint8_t state;
+    uint8_t last_type;
+    uint8_t last_result;
+    uint8_t reset_requested;
+    uint32_t request_id;
+    uint32_t busy_ms;
+} core_diag_retained_t;
+
+RTC_NOINIT_ATTR static core_diag_retained_t retained_diag;
+
+
+static void retain_diagnostic_snapshot(bool reset_requested)
+{
+    retained_diag.magic = CORE_DIAG_RTC_MAGIC;
+    retained_diag.state = diagnostic_state;
+    retained_diag.last_type = diagnostic_last_type;
+    retained_diag.last_result = diagnostic_last_result;
+    retained_diag.reset_requested = reset_requested;
+    retained_diag.request_id = diagnostic_last_request_id;
+    retained_diag.busy_ms = diagnostic_busy_since_us > 0
+        ? (uint32_t)((esp_timer_get_time() - diagnostic_busy_since_us) / 1000)
+        : 0;
+}
+
+
+static size_t build_node_diagnostic(uint8_t *body, size_t capacity)
+{
+    const esp_app_desc_t *description = esp_app_get_description();
+    size_t version_length = strnlen(
+        description->version, HID_TUNNEL_DIAG_VERSION_MAX);
+
+    if (capacity < HID_TUNNEL_DIAG_FIXED_SIZE + version_length) {
+        return 0;
+    }
+
+    bool previous_valid = retained_diag.magic == CORE_DIAG_RTC_MAGIC;
+    int8_t rssi = 0;
+    uint32_t rx_age = 0;
+    bool rx_valid = espnow_transport_get_last_rx(&rssi, &rx_age);
+    uint8_t flags = 0;
+    if (usb_connected) flags |= HID_TUNNEL_DIAG_FLAG_USB_CONNECTED;
+    if (hid_ready) flags |= HID_TUNNEL_DIAG_FLAG_HID_READY;
+    if (battery_transaction_active) flags |= HID_TUNNEL_DIAG_FLAG_BUSY;
+    if (rx_valid) flags |= HID_TUNNEL_DIAG_FLAG_RX_VALID;
+    if (previous_valid) flags |= HID_TUNNEL_DIAG_FLAG_PREV_VALID;
+
+    body[0] = HID_TUNNEL_DIAG_VERSION;
+    body[1] = flags;
+    body[2] = diagnostic_state;
+    body[3] = diagnostic_last_type;
+    body[4] = diagnostic_last_result;
+    body[5] = (uint8_t)esp_reset_reason();
+    body[6] = previous_valid ? retained_diag.state : 0;
+    body[7] = previous_valid ? retained_diag.last_type : 0;
+    body[8] = previous_valid ? retained_diag.last_result : 0;
+    body[9] = previous_valid ? retained_diag.reset_requested : 0;
+    hid_tunnel_put_u32(&body[10], diagnostic_last_request_id);
+    hid_tunnel_put_u32(&body[14], (uint32_t)(esp_timer_get_time() / 1000));
+    hid_tunnel_put_u16(&body[18], connected_vid);
+    hid_tunnel_put_u16(&body[20], connected_pid);
+    body[22] = (uint8_t)rssi;
+    body[23] = rx_age > 255 ? 255 : (uint8_t)rx_age;
+    uint32_t busy_ms = diagnostic_busy_since_us > 0
+        ? (uint32_t)((esp_timer_get_time() - diagnostic_busy_since_us) / 1000)
+        : 0;
+    hid_tunnel_put_u32(&body[24], busy_ms);
+    hid_tunnel_put_u32(&body[28], previous_valid ? retained_diag.request_id : 0);
+    hid_tunnel_put_u32(&body[32], previous_valid ? retained_diag.busy_ms : 0);
+    body[36] = (uint8_t)version_length;
+    memcpy(&body[HID_TUNNEL_DIAG_FIXED_SIZE], description->version, version_length);
+    return HID_TUNNEL_DIAG_FIXED_SIZE + version_length;
+}
+
+
+static bool handle_node_management(const espnow_hid_message_t *request)
+{
+    if (request->magic != HID_TUNNEL_MAGIC || request->body_length != 0) {
+        return false;
+    }
+
+    if (request->type == HID_TUNNEL_NODE_DIAG_REQUEST) {
+        uint8_t body[HID_TUNNEL_DIAG_FIXED_SIZE + HID_TUNNEL_DIAG_VERSION_MAX];
+        size_t length = build_node_diagnostic(body, sizeof(body));
+        (void)espnow_transport_send_message(
+            request->source, HID_TUNNEL_NODE_DIAG_RESPONSE,
+            request->request_id, body, length);
+        return true;
+    }
+
+    if (request->type == HID_TUNNEL_NODE_RESET_REQUEST) {
+        diagnostic_last_type = request->type;
+        diagnostic_last_request_id = request->request_id;
+        diagnostic_last_result = HID_TUNNEL_RESULT_OK;
+        diagnostic_state = HID_TUNNEL_STATE_RESETTING;
+        retain_diagnostic_snapshot(true);
+
+        uint8_t result = HID_TUNNEL_RESULT_OK;
+        (void)espnow_transport_send_message(
+            request->source, HID_TUNNEL_NODE_RESET_RESPONSE,
+            request->request_id, &result, 1);
+        vTaskDelay(pdMS_TO_TICKS(250));
+        esp_restart();
+        return true;
+    }
+
+    return false;
+}
 
 
 typedef struct {
@@ -2087,6 +2208,9 @@ void app_main(void)
             fatal_error("ESP-NOW maintenance", err);
         }
         espnow_started = true;
+        if (!core_usb_proxy_start()) {
+            fatal_error("USB proxy", ESP_FAIL);
+        }
         show_grove_host_button();
 
         while (!grove_host_selected) {
@@ -2101,17 +2225,43 @@ void app_main(void)
                 );
             }
             else if (power.vbus_present) {
-                screen_printf(
-                    "DAMspy M5 Control\n\n"
-                    "EXTERNAL POWER\n\n"
-                    "Core: %d%% %.3fV\n"
-                    "%s\n\n"
-                    "PC USB: leave in charge mode\n"
-                    "Grove: tap button for host",
-                    power.battery_percent,
-                    power.battery_voltage,
-                    power.charging ? "CHARGING" : "Powered / standby"
-                );
+                int8_t link_rssi = 0;
+                uint32_t link_age = 0;
+                if (espnow_transport_get_last_rx(&link_rssi, &link_age)) {
+                    screen_printf(
+                        "DAMspy M5 Control\n\n"
+                        "USB PROXY READY\n\n"
+                        "ESP-NOW RX: %d dBm\n"
+                        "Last gateway traffic: %lus\n\n"
+                        "Core: %d%% %.3fV\n"
+                        "Grove: tap for direct host",
+                        link_rssi,
+                        (unsigned long)link_age,
+                        power.battery_percent,
+                        power.battery_voltage
+                    );
+                }
+                else if (esp_timer_get_time() >= 10000000) {
+                    screen_printf(
+                        "DAMspy M5 Control\n\n"
+                        "NO GATEWAY TRAFFIC\n\n"
+                        "ESP-NOW has received nothing.\n"
+                        "CHECK LINK / RADIO\n\n"
+                        "Core: %d%% %.3fV",
+                        power.battery_percent,
+                        power.battery_voltage
+                    );
+                }
+                else {
+                    screen_printf(
+                        "DAMspy M5 Control\n\n"
+                        "USB PROXY STARTING\n\n"
+                        "Waiting for Gateway traffic...\n\n"
+                        "Core: %d%% %.3fV",
+                        power.battery_percent,
+                        power.battery_voltage
+                    );
+                }
             }
             else {
                 screen_printf(
@@ -2123,7 +2273,11 @@ void app_main(void)
 
             espnow_hid_message_t maintenance_request;
             if (espnow_transport_receive_message(&maintenance_request, 0)) {
-                (void)core_ota_handle_message(&maintenance_request, false);
+                if (!handle_node_management(&maintenance_request)) {
+                    if (!core_ota_handle_message(&maintenance_request, false)) {
+                        (void)core_usb_proxy_handle(&maintenance_request);
+                    }
+                }
             }
             core_ota_poll();
             vTaskDelay(pdMS_TO_TICKS(25));
@@ -2216,6 +2370,8 @@ void app_main(void)
         }
         espnow_started = true;
     }
+
+    diagnostic_state = HID_TUNNEL_STATE_READY;
 
     if (
         xTaskCreate(
@@ -2549,6 +2705,13 @@ void app_main(void)
                     );
                 }
             }
+
+            diagnostic_last_result = hid_response.result;
+            if (!battery_transaction_active) {
+                diagnostic_state = hid_response.result == HID_TUNNEL_RESULT_OK
+                    ? HID_TUNNEL_STATE_READY : HID_TUNNEL_STATE_ERROR;
+                diagnostic_busy_since_us = 0;
+            }
         }
 
 
@@ -2556,9 +2719,20 @@ void app_main(void)
         espnow_hid_message_t request;
 
         if (espnow_transport_receive_message(&request, 0)) {
+            if (handle_node_management(&request)) {
+                continue;
+            }
+
             if (core_ota_handle_message(&request, battery_transaction_active)) {
                 continue;
             }
+
+            diagnostic_last_type = request.type;
+            diagnostic_last_request_id = request.request_id;
+            diagnostic_last_result = HID_TUNNEL_RESULT_OK;
+            diagnostic_state = battery_transaction_active
+                ? HID_TUNNEL_STATE_USB_OPERATION
+                : HID_TUNNEL_STATE_READY;
 
             uint8_t result = HID_TUNNEL_RESULT_OK;
             uint8_t response_type = 0;
@@ -2584,6 +2758,9 @@ void app_main(void)
             }
             else if (battery_transaction_active) {
                 result = HID_TUNNEL_RESULT_BUSY;
+                if (diagnostic_busy_since_us == 0) {
+                    diagnostic_busy_since_us = esp_timer_get_time();
+                }
             }
             else if (!usb_connected || !hid_ready) {
                 result = HID_TUNNEL_RESULT_NO_DEVICE;
@@ -2605,6 +2782,8 @@ void app_main(void)
                     );
 
                     if (hid_err == ESP_OK) {
+                        diagnostic_state = HID_TUNNEL_STATE_USB_OPERATION;
+                        diagnostic_busy_since_us = esp_timer_get_time();
                         continue;
                     }
 
@@ -2637,6 +2816,8 @@ void app_main(void)
                         );
 
                         if (hid_err == ESP_OK) {
+                            diagnostic_state = HID_TUNNEL_STATE_USB_OPERATION;
+                            diagnostic_busy_since_us = esp_timer_get_time();
                             ESP_LOGI(
                                 TAG,
                                 "READ %u bytes, timeout %lu ms",
@@ -2660,6 +2841,8 @@ void app_main(void)
                 response_length = HID_TUNNEL_READ_RESPONSE_OVERHEAD;
                 send_immediate_response = response_type != 0;
             }
+
+            diagnostic_last_result = result;
 
             if (send_immediate_response) {
                 esp_err_t send_err = espnow_transport_send_message(

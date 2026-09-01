@@ -45,6 +45,24 @@ static int8_t last_rssi = 0;
 static int64_t last_rx_time_us = 0;
 
 
+static void espnow_send_callback(
+    const esp_now_send_info_t *info,
+    esp_now_send_status_t status
+)
+{
+    if (info == NULL) {
+        ESP_LOGW(TAG, "TX callback without metadata status=%d", status);
+        return;
+    }
+
+    ESP_LOGI(
+        TAG, "TX dst=" MACSTR " status=%s",
+        MAC2STR(info->des_addr),
+        status == ESP_NOW_SEND_SUCCESS ? "ok" : "fail"
+    );
+}
+
+
 /* Wi-Fi task context: validate, copy, and queue only. */
 static void espnow_receive_callback(
     const esp_now_recv_info_t *info,
@@ -69,6 +87,13 @@ static void espnow_receive_callback(
         last_rssi_valid = true;
         taskEXIT_CRITICAL(&rssi_lock);
     }
+
+    ESP_LOGI(
+        TAG, "RX src=" MACSTR " len=%d rssi=%d first=%02x",
+        MAC2STR(info->src_addr), data_length,
+        info->rx_ctrl != NULL ? info->rx_ctrl->rssi : 0,
+        data[0]
+    );
 
     espnow_frame_t frame = {
         .length = data_length
@@ -329,6 +354,12 @@ esp_err_t espnow_transport_start(void)
     }
 
     err = esp_now_register_recv_cb(espnow_receive_callback);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = esp_now_register_send_cb(espnow_send_callback);
 
     if (err != ESP_OK) {
         return err;
